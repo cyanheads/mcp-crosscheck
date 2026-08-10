@@ -35,7 +35,8 @@ Flags:
                        e.g. --pin mcpo=0.0.20.
   --mcpo-with <spec>   Extra uvx --with dependency constraint for mcpo (repeatable),
                        e.g. --mcpo-with 'mcp<2'.
-  --artifacts <dir>    Save raw captures (ground truth, openapi.json, codex request).
+  --artifacts <dir>    Save the report and raw captures (report.json, ground truth,
+                       openapi.json, codex request).
   --timeout <seconds>  Per-stage timeout. Default: 120.
   --json               Machine-readable report on stdout.
   -h, --help           This help.
