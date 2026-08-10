@@ -166,6 +166,21 @@ bun test
 
 CI is local-first: `devcheck` is the gate, run before every commit.
 
+Tests run against a bundled fixture server (`tests/fixture-server/`) whose schemas are hand-written JSON Schema literals picked to break converters: a root `anyOf`, fields declared only inside branches, two levels of nesting, an `enum` with no `type`, a `const`, a `type` array, and a zero-argument tool. Run it standalone with `bun run fixture-server`, or over streamable-http with `MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=8901 bun run fixture-server`.
+
+`bun test` is hermetic: the default lanes exercise the engine, the adapter failure paths (through an injectable process seam), and the real CLI end to end, with no network and no binaries beyond bun. Lanes that resolve real clients at latest are opt-in:
+
+| Lane | Gate |
+|:--|:--|
+| inspector, mcpo | `CROSSCHECK_E2E_NETWORK=1` — mcpo additionally needs [`uv`](https://docs.astral.sh/uv/) on PATH |
+| codex | `CROSSCHECK_E2E_CODEX=1` — boots the full Codex binary, minutes not seconds |
+
+```sh
+CROSSCHECK_E2E_NETWORK=1 bun test tests/e2e.test.ts
+```
+
+A skipped lane prints what enables it — the gate variable, or the missing prerequisite.
+
 ## License
 
 Apache 2.0 — see [LICENSE](./LICENSE).
