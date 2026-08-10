@@ -25,6 +25,8 @@ export interface GroundTruthTool {
   description: string | null;
   inputSchema: JsonSchema;
   name: string;
+  /** Result schema, present only for the tools that advertise one. */
+  outputSchema?: JsonSchema;
 }
 
 /** The server's own advertised surface, captured via the official MCP SDK client. */
@@ -34,11 +36,23 @@ export interface GroundTruth {
   tools: GroundTruthTool[];
 }
 
-/** One root-level input property, normalized from whatever model a client renders. */
+/**
+ * One input property, normalized from whatever model a client renders. Nested
+ * object fields and array elements recurse through the same shape.
+ */
 export interface RenderedProperty {
+  /** Properties of this property's own object schema; omitted when it declares none. */
+  children?: RenderedProperty[];
   /** Validation-bearing keywords present on the property (minimum, pattern, enum, ...). */
   constraints: Record<string, unknown>;
+  /**
+   * `root` when the property is declared in the containing schema's `properties`,
+   * `branch` when it appears only inside one of that schema's `anyOf`/`oneOf` branches.
+   */
+  declaredIn: 'branch' | 'root';
   description: string | null;
+  /** Element schema when this property is an array; omitted when it declares no `items`. */
+  items?: RenderedProperty;
   name: string;
   required: boolean;
   /** Effective type, or null when the property carries no type information at all. */
@@ -51,6 +65,11 @@ export interface RenderedTool {
   /** Whether the rendered root schema still carries an `anyOf`/`oneOf` union. */
   hasRootUnion: boolean;
   name: string;
+  /**
+   * Fields of the client's rendered result model. Omitted when the client has
+   * no output surface at all — absence of a surface, not loss of one.
+   */
+  outputProperties?: RenderedProperty[];
   properties: RenderedProperty[];
   requiredNames: string[];
 }
@@ -72,6 +91,7 @@ export type RuleId =
   | 'description-lost'
   | 'empty-request-body'
   | 'handshake-failure'
+  | 'output-schema-divergence'
   | 'property-missing'
   | 'property-untyped'
   | 'required-dropped'

@@ -73,6 +73,12 @@ describe('surfaceFromCodexBody', () => {
     expect(parsed?.tools[0]?.name).toBe('echo');
   });
 
+  test('codex renders no output surface — its tool entries carry input parameters only', () => {
+    expect(surface?.tools.every((tool) => tool.outputProperties === undefined)).toBe(true);
+    const findings = compareSurface(groundTruth.tools, surface ?? { tools: [] });
+    expect(findings.some((finding) => finding.rule === 'output-schema-divergence')).toBe(false);
+  });
+
   test('returns null for bodies without MCP tools', () => {
     expect(
       surfaceFromCodexBody({ tools: [{ name: 'exec_command', type: 'function' }] }),
@@ -107,6 +113,47 @@ describe('surfaceFromOpenApiDoc', () => {
     const findings = compareSurface(groundTruth.tools, surface ?? { tools: [] });
     expect(findings.filter((finding) => finding.severity === 'fail')).toEqual([]);
     expect(findings.some((finding) => finding.detail.includes('enum'))).toBe(true);
+  });
+
+  test('the anyOf response envelope becomes the rendered result model', () => {
+    // mcpo wraps the generated model in `{anyOf: [{$ref: ...}, {}]}`; the union
+    // branch is where every output field lives.
+    const explorer = surface?.tools.find((tool) => tool.name === 'template_data_explorer');
+    expect(explorer?.outputProperties?.map((property) => property.name)).toEqual([
+      'rows',
+      'generatedAt',
+      'summary',
+    ]);
+    const generatedAt = explorer?.outputProperties?.find(
+      (property) => property.name === 'generatedAt',
+    );
+    expect(generatedAt?.type).toBe('string');
+    expect(generatedAt?.description).not.toBeNull();
+  });
+
+  test('response models nest through rows.items and summary', () => {
+    const explorer = surface?.tools.find((tool) => tool.name === 'template_data_explorer');
+    const rows = explorer?.outputProperties?.find((property) => property.name === 'rows');
+    expect(rows?.type).toBe('array');
+    expect(rows?.items?.children?.map((child) => child.name)).toEqual([
+      'id',
+      'region',
+      'product',
+      'units',
+      'revenue',
+      'date',
+    ]);
+    const summary = explorer?.outputProperties?.find((property) => property.name === 'summary');
+    expect(summary?.children?.map((child) => child.name)).toEqual([
+      'totalRows',
+      'totalRevenue',
+      'totalUnits',
+    ]);
+  });
+
+  test('ground truth advertising no output schema yields no output findings', () => {
+    const findings = compareSurface(groundTruth.tools, surface ?? { tools: [] });
+    expect(findings.some((finding) => finding.rule === 'output-schema-divergence')).toBe(false);
   });
 
   test('a null requestBody renders as an empty surface the engine can flag', () => {

@@ -3,10 +3,16 @@
  * MCP Inspector CLI adapter. Runs `@modelcontextprotocol/inspector --cli`
  * headlessly for a verbatim `tools/list`, doubling as the protocol-handshake
  * baseline, plus an optional `tools/call` canary round-trip.
+ *
+ * The canary goes out as a single `--tool-args-json` object, which the client
+ * passes through untouched. Its `--tool-arg key=value` alternative runs every
+ * value through `JSON.parse` and keeps the raw text only when that throws, so a
+ * string spelled `"123"` would arrive as a number and an empty one would be
+ * rejected outright — a healthy server reported as a failed round-trip.
  */
 import { z } from 'zod';
 
-import { renderedToolFromJsonSchema } from '../schema.js';
+import { renderedPropertiesFromJsonSchema, renderedToolFromJsonSchema } from '../schema.js';
 import type {
   Adapter,
   AdapterContext,
@@ -24,6 +30,7 @@ const ListToolsOutput = z.object({
       description: z.string().optional(),
       inputSchema: z.record(z.string(), z.unknown()).optional(),
       name: z.string(),
+      outputSchema: z.record(z.string(), z.unknown()).optional(),
     }),
   ),
 });
@@ -73,16 +80,47 @@ function resolveVersion(ctx: AdapterContext, exec: Exec): Promise<string | null>
   return npmLatestVersion('@modelcontextprotocol/inspector', ctx.workDir, exec);
 }
 
-function serializeToolArg(value: unknown): string {
-  return typeof value === 'string' ? value : JSON.stringify(value);
+/** First release carrying `--tool-args-json`, which passes argument values verbatim. */
+const TOOL_ARGS_JSON_MAJOR = 2;
+
+/**
+ * Canary flags for the resolved client, or null when it cannot express these
+ * arguments. Before 2.0.0 the only encoding is `--tool-arg key=value`, whose
+ * value side is text: a non-string argument has no faithful spelling there, and
+ * an empty one has nothing to spell. An unresolved version means latest, which
+ * carries the flag.
+ */
+function canaryArgFlags(
+  args: Record<string, unknown>,
+  resolvedVersion: string | null,
+): string[] | null {
+  const major = Number(resolvedVersion?.split('.')[0]);
+  if (!Number.isInteger(major) || major >= TOOL_ARGS_JSON_MAJOR) {
+    return ['--tool-args-json', JSON.stringify(args)];
+  }
+  const flags: string[] = [];
+  for (const [key, value] of Object.entries(args)) {
+    if (typeof value !== 'string' || value === '') return null;
+    flags.push('--tool-arg', `${key}=${value}`);
+  }
+  return flags;
 }
 
-async function runCanary(ctx: AdapterContext, exec: Exec): Promise<CanaryOutcome | null> {
+async function runCanary(
+  ctx: AdapterContext,
+  exec: Exec,
+  resolvedVersion: string | null,
+): Promise<CanaryOutcome | null> {
   if (ctx.canary === null) return null;
-  const argFlags = Object.entries(ctx.canary.args).flatMap(([key, value]) => [
-    '--tool-arg',
-    `${key}=${serializeToolArg(value)}`,
-  ]);
+  const argFlags = canaryArgFlags(ctx.canary.args, resolvedVersion);
+  if (argFlags === null) {
+    return {
+      attempted: false,
+      detail:
+        'this inspector predates --tool-args-json, and --tool-arg cannot carry a non-string or empty argument',
+      ok: null,
+    };
+  }
   const result = await exec.capture(
     'npx',
     [...baseArgs(ctx), '--method', 'tools/call', '--tool-name', ctx.canary.tool, ...argFlags],
@@ -148,12 +186,20 @@ async function run(ctx: AdapterContext): Promise<AdapterRunResult> {
   }
 
   const surface: RenderedSurface = {
-    tools: parsed.data.tools.map((tool) =>
-      renderedToolFromJsonSchema(tool.name, tool.description ?? null, tool.inputSchema ?? {}),
-    ),
+    tools: parsed.data.tools.map((tool) => {
+      const rendered = renderedToolFromJsonSchema(
+        tool.name,
+        tool.description ?? null,
+        tool.inputSchema ?? {},
+      );
+      if (tool.outputSchema !== undefined) {
+        rendered.outputProperties = renderedPropertiesFromJsonSchema(tool.outputSchema);
+      }
+      return rendered;
+    }),
   };
 
-  const canary = await runCanary(ctx, exec);
+  const canary = await runCanary(ctx, exec, resolvedVersion);
   return finish({ canary, status: 'ok', statusDetail: null, surface });
 }
 

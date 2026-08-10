@@ -16,6 +16,7 @@ import type {
   CanarySpec,
   GroundTruth,
   GroundTruthTool,
+  JsonSchema,
   TargetSpec,
 } from './types.js';
 import { excerpt } from './util/exec.js';
@@ -76,8 +77,12 @@ export function captureGroundTruth(target: TargetSpec, timeoutMs: number): Promi
       for (const tool of result.tools) {
         tools.push({
           description: typeof tool.description === 'string' ? tool.description : null,
-          inputSchema: tool.inputSchema as GroundTruthTool['inputSchema'],
+          inputSchema: tool.inputSchema as JsonSchema,
           name: tool.name,
+          // Most tools advertise no result schema; the key stays off those.
+          ...(tool.outputSchema === undefined
+            ? {}
+            : { outputSchema: tool.outputSchema as JsonSchema }),
         });
       }
       if (result.nextCursor === undefined) break;

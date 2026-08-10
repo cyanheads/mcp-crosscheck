@@ -74,7 +74,8 @@ export const FIXTURE_TOOLS: Tool[] = [
     name: 'branch_only_fields',
   },
   {
-    description: 'Nest an object property two levels deep, with bounded scalars and an array.',
+    description:
+      'Nest an object property two levels deep, with bounded scalars and an array. The only tool that advertises an outputSchema, itself nested: an array of objects and a sub-object, the shape converters turn into linked response models.',
     inputSchema: {
       properties: {
         config: {
@@ -110,6 +111,33 @@ export const FIXTURE_TOOLS: Tool[] = [
       type: 'object',
     },
     name: 'nested_config',
+    outputSchema: {
+      properties: {
+        attempts: {
+          description: 'One entry per connection attempt.',
+          items: {
+            properties: {
+              durationMs: { description: 'How long the attempt took.', type: 'integer' },
+              ok: { description: 'Whether the attempt succeeded.', type: 'boolean' },
+            },
+            required: ['ok', 'durationMs'],
+            type: 'object',
+          },
+          type: 'array',
+        },
+        summary: {
+          description: 'Aggregate outcome across every attempt.',
+          properties: {
+            connected: { description: 'Whether any attempt succeeded.', type: 'boolean' },
+            endpoint: { description: 'The endpoint that was dialled.', type: 'string' },
+          },
+          required: ['connected'],
+          type: 'object',
+        },
+      },
+      required: ['attempts', 'summary'],
+      type: 'object',
+    },
   },
   {
     description: 'Carry the type-inference edges: an enum with no type, a const, and a type array.',
@@ -130,3 +158,19 @@ export const FIXTURE_TOOLS: Tool[] = [
     name: 'no_args',
   },
 ];
+
+/**
+ * Structured payloads for the tools that advertise an `outputSchema`, keyed by
+ * tool name. A tool that advertises one must answer with `structuredContent`:
+ * the SDK client compiles a validator per advertised output schema at
+ * `tools/list` and rejects a call result that carries none.
+ */
+export const FIXTURE_STRUCTURED_RESULTS: Record<string, Record<string, unknown>> = {
+  nested_config: {
+    attempts: [
+      { durationMs: 12, ok: false },
+      { durationMs: 4, ok: true },
+    ],
+    summary: { connected: true, endpoint: 'fixture://local' },
+  },
+};

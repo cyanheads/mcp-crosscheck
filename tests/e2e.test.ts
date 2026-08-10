@@ -24,7 +24,7 @@ import { captureGroundTruth, runGroundTruthCanary } from '../src/ground-truth.js
 import { compareSurface } from '../src/invariants.js';
 import { renderHumanReport } from '../src/report.js';
 import { CrosscheckUsageError, runCrosscheck } from '../src/run.js';
-import { renderedToolFromJsonSchema } from '../src/schema.js';
+import { renderedPropertiesFromJsonSchema, renderedToolFromJsonSchema } from '../src/schema.js';
 import type {
   CanarySpec,
   GroundTruth,
@@ -44,7 +44,8 @@ const FIXTURE_SERVER = join(import.meta.dir, 'fixture-server', 'server.ts');
 const INSPECTOR_PIN = '2.1.0';
 const TIMEOUT_MS = 30_000;
 
-const CANARY: CanarySpec = { args: { message: 'probe' }, tool: 'echo_message' };
+/** `repeat` is an integer: every adapter has to carry a non-string argument through unchanged. */
+const CANARY: CanarySpec = { args: { message: 'probe', repeat: 2 }, tool: 'echo_message' };
 /** The same canary as the `--canary '<tool>={json}'` flag spells it. */
 const CANARY_FLAG = `${CANARY.tool}=${JSON.stringify(CANARY.args)}`;
 const STDIO_TARGET: TargetSpec = {
@@ -70,12 +71,24 @@ function runCli(args: string[], timeoutMs = 60_000): Promise<ExecResult> {
   return execCapture(process.execPath, [CLI, ...args], { cwd: REPO_ROOT, timeoutMs });
 }
 
+/** The captured shape of each fixture tool; `outputSchema` rides along only where advertised. */
+const EXPECTED_TOOLS = FIXTURE_TOOLS.map((tool) => ({
+  description: tool.description ?? null,
+  inputSchema: tool.inputSchema,
+  name: tool.name,
+  ...(tool.outputSchema === undefined ? {} : { outputSchema: tool.outputSchema }),
+}));
+
 /** The verbatim rendering a faithful client produces — the zero-divergence baseline. */
 function verbatimSurface(groundTruth: GroundTruth): RenderedSurface {
   return {
-    tools: groundTruth.tools.map((tool) =>
-      renderedToolFromJsonSchema(tool.name, tool.description, tool.inputSchema),
-    ),
+    tools: groundTruth.tools.map((tool) => {
+      const rendered = renderedToolFromJsonSchema(tool.name, tool.description, tool.inputSchema);
+      if (tool.outputSchema !== undefined) {
+        rendered.outputProperties = renderedPropertiesFromJsonSchema(tool.outputSchema);
+      }
+      return rendered;
+    }),
   };
 }
 
@@ -89,13 +102,7 @@ describe('hermetic core: stdio', () => {
   test('captures the fixture schemas verbatim', () => {
     expect(groundTruth.serverName).toBe('crosscheck-fixture-server');
     expect(groundTruth.serverVersion).toBe('1.0.0');
-    expect(groundTruth.tools).toEqual(
-      FIXTURE_TOOLS.map((tool) => ({
-        description: tool.description ?? null,
-        inputSchema: tool.inputSchema,
-        name: tool.name,
-      })),
-    );
+    expect(groundTruth.tools).toEqual(EXPECTED_TOOLS);
   });
 
   test('a client that renders ground truth verbatim diverges nowhere', () => {
@@ -117,6 +124,18 @@ describe('hermetic core: stdio', () => {
       detail: null,
       ok: true,
     });
+  });
+
+  test('a tool advertising an output schema answers with validating structured content', async () => {
+    // The SDK client compiles a validator per advertised output schema, so a
+    // missing or non-conforming payload surfaces here as a failed call.
+    expect(
+      await runGroundTruthCanary(
+        STDIO_TARGET,
+        { args: { config: { retries: 1 } }, tool: 'nested_config' },
+        TIMEOUT_MS,
+      ),
+    ).toEqual({ attempted: true, detail: null, ok: true });
   });
 
   test('a canary the fixture rejects reports the failure rather than throwing', async () => {
@@ -155,13 +174,7 @@ describe('hermetic core: streamable-http', () => {
   test('captures the fixture schemas verbatim, same as stdio', async () => {
     const groundTruth = await captureGroundTruth(target, TIMEOUT_MS);
     expect(groundTruth.serverName).toBe('crosscheck-fixture-server');
-    expect(groundTruth.tools).toEqual(
-      FIXTURE_TOOLS.map((tool) => ({
-        description: tool.description ?? null,
-        inputSchema: tool.inputSchema,
-        name: tool.name,
-      })),
-    );
+    expect(groundTruth.tools).toEqual(EXPECTED_TOOLS);
   });
 
   test('the canary round-trips over http', async () => {
@@ -289,6 +302,47 @@ describe.skipIf(!NETWORK_LANES)('inspector lane', () => {
     expect(inspector?.toolCount).toBe(6);
     expect(inspector?.canary?.ok).toBe(true);
     expect(inspector?.findings).toEqual([]);
+  }, 360_000);
+
+  /**
+   * The encoding claim, measured against the client itself: the fixture echoes
+   * back the arguments it received, so a deep equality against what went in
+   * proves each shape survived. `--tool-arg key=value` would coerce the string
+   * `"123"` to a number and reject the empty one before the call went out.
+   */
+  test('--tool-args-json delivers every argument shape verbatim', async () => {
+    const args = {
+      blank: '',
+      count: 3,
+      equals: 'left=right',
+      flag: true,
+      message: '123',
+      nested: { depth: { value: 1 } },
+    };
+    const result = await execCapture(
+      'npx',
+      [
+        '-y',
+        `@modelcontextprotocol/inspector@${INSPECTOR_PIN}`,
+        '--cli',
+        process.execPath,
+        FIXTURE_SERVER,
+        '--method',
+        'tools/call',
+        '--tool-name',
+        'echo_message',
+        '--tool-args-json',
+        JSON.stringify(args),
+      ],
+      // A neutral cwd, the same reason the adapter runs package runners from one.
+      { cwd: tmpdir(), timeoutMs: 300_000 },
+    );
+    expect(result.code).toBe(0);
+    const body = result.stdout.trim();
+    const call = JSON.parse(body.slice(body.indexOf('{'), body.lastIndexOf('}') + 1)) as {
+      content: { text: string }[];
+    };
+    expect(JSON.parse(call.content[0]?.text ?? '{}')).toEqual(args);
   }, 360_000);
 });
 

@@ -75,6 +75,18 @@ function captureExec(...script: Partial<ExecResult>[]): Exec {
   };
 }
 
+/** `captureExec`, with every command's argv appended to `calls` for flag assertions. */
+function recordingExec(calls: string[][], ...script: Partial<ExecResult>[]): Exec {
+  const inner = captureExec(...script);
+  return {
+    capture: (command, args, opts) => {
+      calls.push(args);
+      return inner.capture(command, args, opts);
+    },
+    spawn: inner.spawn,
+  };
+}
+
 /** An `Exec` that only spawns — used where the adapter's version is pinned. */
 function spawnExec(spawn: Exec['spawn']): Exec {
   return {
@@ -139,7 +151,86 @@ describe('inspector', () => {
     );
     expect(result.status).toBe('ok');
     expect(result.surface?.tools.map((tool) => tool.name)).toEqual(['echo_message']);
+    expect(result.surface?.tools[0]?.outputProperties).toBeUndefined();
     expect(result.canary).toEqual({ attempted: true, detail: null, ok: true });
+  });
+
+  test('an advertised outputSchema becomes the rendered result model', async () => {
+    const exec = captureExec({
+      stdout: JSON.stringify({
+        tools: [
+          {
+            description: 'Echo.',
+            inputSchema: { properties: { message: { type: 'string' } }, type: 'object' },
+            name: 'echo_message',
+            outputSchema: {
+              properties: { echoed: { description: 'What came back.', type: 'string' } },
+              type: 'object',
+            },
+          },
+        ],
+      }),
+    });
+    const result = await inspectorAdapter.run(context(exec));
+    const rendered = result.surface?.tools[0];
+    expect(rendered?.outputProperties?.map((property) => property.name)).toEqual(['echoed']);
+    expect(rendered?.outputProperties?.[0]?.type).toBe('string');
+  });
+
+  const LIST_AND_CALL: Partial<ExecResult>[] = [
+    { stdout: JSON.stringify({ tools: [] }) },
+    { stdout: JSON.stringify({ content: [{ text: '{}', type: 'text' }] }) },
+  ];
+  const MIXED_ARGS = { count: 3, message: '123', nested: { deep: true } };
+
+  test('the canary goes out as one --tool-args-json object', async () => {
+    const calls: string[][] = [];
+    const result = await inspectorAdapter.run(
+      context(recordingExec(calls, ...LIST_AND_CALL), {
+        canary: { args: MIXED_ARGS, tool: 'echo_message' },
+      }),
+    );
+    expect(result.canary?.ok).toBe(true);
+    const call = calls[1] ?? [];
+    expect(call).not.toContain('--tool-arg');
+    expect(call[call.indexOf('--tool-args-json') + 1]).toBe(JSON.stringify(MIXED_ARGS));
+  });
+
+  test('a pinned pre-2.0.0 inspector falls back to --tool-arg for string arguments', async () => {
+    const calls: string[][] = [];
+    const result = await inspectorAdapter.run(
+      context(recordingExec(calls, ...LIST_AND_CALL), {
+        canary: { args: { mode: 'standard', message: 'probe' }, tool: 'echo_message' },
+        pins: { inspector: '1.0.1' },
+      }),
+    );
+    expect(result.canary?.ok).toBe(true);
+    const call = calls[1] ?? [];
+    expect(call).not.toContain('--tool-args-json');
+    expect(call.slice(call.indexOf('--tool-arg'))).toEqual([
+      '--tool-arg',
+      'mode=standard',
+      '--tool-arg',
+      'message=probe',
+    ]);
+  });
+
+  test('a pinned pre-2.0.0 inspector skips rather than mangling what it cannot spell', async () => {
+    for (const args of [{ repeat: 3 }, { message: '' }]) {
+      const calls: string[][] = [];
+      const result = await inspectorAdapter.run(
+        context(recordingExec(calls, ...LIST_AND_CALL), {
+          canary: { args, tool: 'echo_message' },
+          pins: { inspector: '1.0.1' },
+        }),
+      );
+      expect(result.status).toBe('ok');
+      expect(result.canary?.attempted).toBe(false);
+      expect(result.canary?.ok).toBeNull();
+      expect(result.canary?.detail).toContain('--tool-args-json');
+      // Skipped means skipped: no tools/call was ever issued.
+      expect(calls).toHaveLength(1);
+    }
   });
 
   test('ok surface, failed canary: the server rejected the call', async () => {

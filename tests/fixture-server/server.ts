@@ -18,7 +18,12 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 
-import { FIXTURE_SERVER_NAME, FIXTURE_SERVER_VERSION, FIXTURE_TOOLS } from './tools.js';
+import {
+  FIXTURE_SERVER_NAME,
+  FIXTURE_SERVER_VERSION,
+  FIXTURE_STRUCTURED_RESULTS,
+  FIXTURE_TOOLS,
+} from './tools.js';
 
 const DEFAULT_HTTP_PORT = 8901;
 
@@ -30,13 +35,21 @@ function createFixtureServer(): Server {
 
   server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: FIXTURE_TOOLS }));
 
-  /** Every tool echoes the arguments it received, so a canary round-trip proves argument fidelity. */
+  /**
+   * Every tool echoes the arguments it received, so a canary round-trip proves
+   * argument fidelity. A tool that advertises an `outputSchema` answers with its
+   * structured payload alongside the echo, which the SDK client requires.
+   */
   server.setRequestHandler(CallToolRequestSchema, (request) => {
     const { arguments: args, name } = request.params;
     if (!FIXTURE_TOOLS.some((tool) => tool.name === name)) {
       return { content: [{ text: `unknown tool: ${name}`, type: 'text' }], isError: true };
     }
-    return { content: [{ text: JSON.stringify(args ?? {}), type: 'text' }] };
+    const structuredContent = FIXTURE_STRUCTURED_RESULTS[name];
+    return {
+      content: [{ text: JSON.stringify(args ?? {}), type: 'text' }],
+      ...(structuredContent === undefined ? {} : { structuredContent }),
+    };
   });
 
   return server;

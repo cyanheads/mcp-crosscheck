@@ -4,12 +4,17 @@
  * the target, reads the generated openapi.json as the rendered surface, and
  * optionally round-trips the canary as a live POST. Requires `uv` on PATH.
  */
-import { isRecord, renderedToolFromJsonSchema } from '../schema.js';
+import {
+  isRecord,
+  renderedPropertiesFromJsonSchema,
+  renderedToolFromJsonSchema,
+} from '../schema.js';
 import type {
   Adapter,
   AdapterContext,
   AdapterRunResult,
   CanaryOutcome,
+  RenderedProperty,
   RenderedSurface,
   RenderedTool,
   TargetSpec,
@@ -45,6 +50,29 @@ export function surfaceFromOpenApiDoc(doc: unknown): RenderedSurface | null {
   return { tools };
 }
 
+/** The `application/json` schema of an OpenAPI request body or response object. */
+function jsonSchemaOf(container: unknown): unknown {
+  if (!isRecord(container) || !isRecord(container.content)) return;
+  const jsonContent = container.content['application/json'];
+  if (!isRecord(jsonContent)) return;
+  return jsonContent.schema;
+}
+
+/**
+ * The result model mcpo generates from a tool's `outputSchema`. It arrives
+ * wrapped in a union envelope — `{anyOf: [{$ref: <tool>_response_model}, {}]}` —
+ * whose branches the normalizer collects, so the model's fields come through
+ * without unwrapping the envelope by hand.
+ */
+function outputPropertiesOf(
+  post: Record<string, unknown>,
+  doc: unknown,
+): RenderedProperty[] | null {
+  if (!isRecord(post.responses)) return null;
+  const schema = jsonSchemaOf(post.responses['200']);
+  return schema === undefined ? null : renderedPropertiesFromJsonSchema(schema, doc);
+}
+
 /** Map one OpenAPI path item to a rendered tool; returns null for non-tool routes. */
 function toolFromPath(path: string, item: unknown, doc: unknown): RenderedTool | null {
   if (!isRecord(item) || !isRecord(item.post)) return null;
@@ -58,16 +86,13 @@ function toolFromPath(path: string, item: unknown, doc: unknown): RenderedTool |
         ? post.summary
         : null;
 
-  const requestBody = post.requestBody;
-  if (!isRecord(requestBody)) {
-    // No request body at all — an empty surface the invariant engine judges
-    // against whether ground truth advertises input properties.
-    return renderedToolFromJsonSchema(name, description, {}, doc);
-  }
-  const content = isRecord(requestBody.content) ? requestBody.content : {};
-  const jsonContent = isRecord(content['application/json']) ? content['application/json'] : {};
-  const schema = jsonContent.schema ?? {};
-  return renderedToolFromJsonSchema(name, description, schema, doc);
+  // No request body at all renders as an empty surface, which the invariant
+  // engine judges against whether ground truth advertises input properties.
+  const inputSchema = jsonSchemaOf(post.requestBody) ?? {};
+  const tool = renderedToolFromJsonSchema(name, description, inputSchema, doc);
+  const outputProperties = outputPropertiesOf(post, doc);
+  if (outputProperties !== null) tool.outputProperties = outputProperties;
+  return tool;
 }
 
 async function resolveVersion(ctx: AdapterContext, exec: Exec): Promise<string | null> {

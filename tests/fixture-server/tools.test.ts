@@ -8,21 +8,30 @@
 import { describe, expect, test } from 'bun:test';
 
 import { compareSurface } from '../../src/invariants.js';
-import { effectiveType, renderedToolFromJsonSchema } from '../../src/schema.js';
+import {
+  effectiveType,
+  renderedPropertiesFromJsonSchema,
+  renderedToolFromJsonSchema,
+} from '../../src/schema.js';
 import type { GroundTruthTool, RenderedSurface } from '../../src/types.js';
-import { FIXTURE_TOOLS } from './tools.js';
+import { FIXTURE_STRUCTURED_RESULTS, FIXTURE_TOOLS } from './tools.js';
 
 const groundTruthTools: GroundTruthTool[] = FIXTURE_TOOLS.map((tool) => ({
   description: tool.description ?? null,
   inputSchema: tool.inputSchema,
   name: tool.name,
+  ...(tool.outputSchema === undefined ? {} : { outputSchema: tool.outputSchema }),
 }));
 
+/** The fixture rendered by a faithful client — input surface and output model alike. */
 const rendered = new Map(
-  groundTruthTools.map((tool) => [
-    tool.name,
-    renderedToolFromJsonSchema(tool.name, tool.description, tool.inputSchema),
-  ]),
+  groundTruthTools.map((tool) => {
+    const renderedTool = renderedToolFromJsonSchema(tool.name, tool.description, tool.inputSchema);
+    if (tool.outputSchema !== undefined) {
+      renderedTool.outputProperties = renderedPropertiesFromJsonSchema(tool.outputSchema);
+    }
+    return [tool.name, renderedTool] as const;
+  }),
 );
 
 function schemaOf(name: string): Record<string, unknown> {
@@ -63,6 +72,16 @@ describe('fixture surface', () => {
     const surface: RenderedSurface = { tools: [...rendered.values()] };
     expect(compareSurface(groundTruthTools, surface)).toEqual([]);
   });
+
+  test('only nested_config advertises an output schema — never the canary tool', () => {
+    // echo_message is the canary everywhere: a tool that advertises an output
+    // schema must answer with structuredContent, and mcpo additionally validates
+    // the proxied response against the model it generates from that schema.
+    expect(
+      FIXTURE_TOOLS.filter((tool) => tool.outputSchema !== undefined).map((tool) => tool.name),
+    ).toEqual(['nested_config']);
+    expect(Object.keys(FIXTURE_STRUCTURED_RESULTS)).toEqual(['nested_config']);
+  });
 });
 
 describe('per-tool shapes', () => {
@@ -86,6 +105,9 @@ describe('per-tool shapes', () => {
     const union = rendered.get('union_modes');
     expect(union?.hasRootUnion).toBe(true);
     expect(union?.properties.map((property) => property.name)).toEqual(['a', 'b']);
+    expect(union?.properties.every((property) => property.declaredIn === 'root')).toBe(true);
+    // Both branches carry `required` only — conditional, so root requires nothing.
+    expect(union?.requiredNames).toEqual([]);
   });
 
   test('branch_only_fields declares its fields solely inside anyOf branches', () => {
@@ -94,7 +116,10 @@ describe('per-tool shapes', () => {
     expect(schema.anyOf).toHaveLength(2);
     const branchOnly = rendered.get('branch_only_fields');
     expect(branchOnly?.hasRootUnion).toBe(true);
-    expect(branchOnly?.properties).toEqual([]);
+    expect(branchOnly?.properties.map((property) => property.name)).toEqual(['by_id', 'by_name']);
+    expect(branchOnly?.properties.every((property) => property.declaredIn === 'branch')).toBe(true);
+    expect(branchOnly?.requiredNames).toEqual([]);
+    expect(branchOnly?.properties.some((property) => property.required)).toBe(false);
   });
 
   test('nested_config nests two levels below the root property', () => {
@@ -102,6 +127,26 @@ describe('per-tool shapes', () => {
     expect(dig(config, 'properties', 'retries').minimum).toBe(0);
     expect(dig(config, 'properties', 'tags').maxItems).toBe(5);
     expect(dig(config, 'properties', 'transport', 'properties', 'timeoutMs').minimum).toBe(1);
+
+    const renderedConfig = rendered.get('nested_config')?.properties[0];
+    const transport = renderedConfig?.children?.find((child) => child.name === 'transport');
+    expect(transport?.children?.find((child) => child.name === 'timeoutMs')?.required).toBe(true);
+    expect(renderedConfig?.children?.find((child) => child.name === 'tags')?.items?.type).toBe(
+      'string',
+    );
+  });
+
+  test('nested_config nests its output schema too, and the structured result satisfies it', () => {
+    const output = renderedPropertiesFromJsonSchema(
+      FIXTURE_TOOLS.find((tool) => tool.name === 'nested_config')?.outputSchema,
+    );
+    expect(output.map((property) => property.name)).toEqual(['attempts', 'summary']);
+    expect(output[0]?.items?.children?.map((child) => child.name)).toEqual(['durationMs', 'ok']);
+    expect(output[1]?.children?.map((child) => child.name)).toEqual(['connected', 'endpoint']);
+
+    const result = FIXTURE_STRUCTURED_RESULTS.nested_config;
+    expect(Object.keys(result ?? {}).sort()).toEqual(['attempts', 'summary']);
+    expect(rendered.get('nested_config')?.outputProperties).toEqual(output);
   });
 
   test('typed_edges covers enum-without-type, const, and type arrays', () => {

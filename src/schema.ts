@@ -1,11 +1,26 @@
 /**
  * @file src/schema.ts
- * JSON Schema normalization: turns any JSON-Schema-shaped tool input (ground
- * truth, MCP Inspector output, Codex function parameters) into the comparable
- * `RenderedTool` model. Local `$ref`s are resolved against the containing
- * document; remote refs are left untouched.
+ * JSON Schema normalization: turns any JSON-Schema-shaped tool surface (ground
+ * truth, MCP Inspector output, Codex function parameters, an mcpo result model)
+ * into the comparable `RenderedTool` / `RenderedProperty` model. Local `$ref`s
+ * are resolved against the containing document; remote refs are left untouched.
+ *
+ * Normalization walks the whole schema — nested objects and array elements —
+ * and flattens each level's `properties` together with the `properties` of its
+ * `anyOf`/`oneOf` branches. Every caller gets the same treatment, ground truth
+ * and client renderings alike: the diff only means anything if both sides
+ * flatten identically.
  */
 import type { JsonSchema, RenderedProperty, RenderedTool } from './types.js';
+
+/**
+ * Levels the walk descends before it stops. Together with the visited set this
+ * is the only termination guarantee for a schema that recurses structurally
+ * (`$defs.Node.properties.child.$ref` → `#/$defs/Node`): `resolveRef`'s own
+ * counter bounds `$ref` → `$ref` chains within one resolution and resets on
+ * every call, so such a schema never reaches it.
+ */
+const MAX_DEPTH = 6;
 
 /** Validation-bearing keywords compared between ground truth and rendered surfaces. */
 export const CONSTRAINT_KEYWORDS = [
@@ -85,6 +100,119 @@ export function extractConstraints(schema: JsonSchema): Record<string, unknown> 
 }
 
 /**
+ * Names listed in one schema's own `required` array. Branch `required` arrays
+ * are excluded by construction: a branch's requirement holds only when that
+ * branch applies, so it never becomes an unconditional requirement.
+ */
+function requiredNamesOf(schema: JsonSchema): string[] {
+  return Array.isArray(schema.required) ? schema.required.map(String) : [];
+}
+
+/**
+ * Layer a `$ref`'s sibling keywords over the schema it points at. Siblings are
+ * valid since JSON Schema 2020-12 / OpenAPI 3.1, and converters put the
+ * reference-site annotation there — mcpo renders a nested object as
+ * `{$ref, description}` — so dropping them would report a description the
+ * client actually kept as lost.
+ */
+function withRefSiblings(target: JsonSchema, source: unknown): JsonSchema {
+  if (!isRecord(source) || typeof source.$ref !== 'string') return target;
+  const siblings = Object.entries(source).filter(([keyword]) => keyword !== '$ref');
+  return siblings.length === 0 ? target : { ...target, ...Object.fromEntries(siblings) };
+}
+
+/** Normalize one property schema, descending into its object fields and array elements. */
+function propertyFrom(
+  name: string,
+  rawSchema: unknown,
+  declaredIn: RenderedProperty['declaredIn'],
+  required: boolean,
+  doc: unknown,
+  depth: number,
+  seen: ReadonlySet<object>,
+): RenderedProperty {
+  const resolved = resolveRef(rawSchema, doc);
+  if (resolved === null) {
+    return { constraints: {}, declaredIn, description: null, name, required, type: null };
+  }
+  const schema = withRefSiblings(resolved, rawSchema);
+  const property: RenderedProperty = {
+    constraints: extractConstraints(schema),
+    declaredIn,
+    description: typeof schema.description === 'string' ? schema.description : null,
+    name,
+    required,
+    type: effectiveType(schema, doc),
+  };
+  // The visited set tracks the ref target, so a loop back to it is caught
+  // whatever the reference site layered on top.
+  if (depth >= MAX_DEPTH || seen.has(resolved)) return property;
+
+  const nestedSeen = new Set(seen).add(resolved);
+  const children = propertiesOf(schema, doc, depth + 1, nestedSeen);
+  if (children.length > 0) property.children = children;
+  if (isRecord(schema.items)) {
+    property.items = propertyFrom('[]', schema.items, 'root', false, doc, depth + 1, nestedSeen);
+  }
+  return property;
+}
+
+/**
+ * Every property declared at one schema level: the level's own `properties`
+ * first, then the `properties` of each `anyOf`/`oneOf` branch. A name declared
+ * at the level itself wins; a name repeated across branches is collected once.
+ */
+function propertiesOf(
+  schema: JsonSchema,
+  doc: unknown,
+  depth: number,
+  seen: ReadonlySet<object>,
+): RenderedProperty[] {
+  const requiredNames = requiredNamesOf(schema);
+  const properties: RenderedProperty[] = [];
+  const collected = new Set<string>();
+
+  const collect = (
+    entries: Record<string, unknown>,
+    declaredIn: RenderedProperty['declaredIn'],
+  ): void => {
+    for (const [name, rawSchema] of Object.entries(entries)) {
+      if (collected.has(name)) continue;
+      collected.add(name);
+      properties.push(
+        propertyFrom(name, rawSchema, declaredIn, requiredNames.includes(name), doc, depth, seen),
+      );
+    }
+  };
+
+  if (isRecord(schema.properties)) collect(schema.properties, 'root');
+  for (const keyword of ['anyOf', 'oneOf'] as const) {
+    const branches = schema[keyword];
+    if (!Array.isArray(branches)) continue;
+    for (const branch of branches) {
+      const resolved = resolveRef(branch, doc);
+      if (resolved === null || !isRecord(resolved.properties)) continue;
+      collect(resolved.properties, 'branch');
+    }
+  }
+  return properties;
+}
+
+/**
+ * Normalize a standalone schema's property tree — the shape a result model is
+ * compared as, where only the fields matter and there is no tool-level
+ * description or root `required` list to carry.
+ */
+export function renderedPropertiesFromJsonSchema(
+  schema: unknown,
+  root?: unknown,
+): RenderedProperty[] {
+  const doc = root ?? schema;
+  const resolved = resolveRef(schema, doc) ?? {};
+  return propertiesOf(resolved, doc, 0, new Set([resolved]));
+}
+
+/**
  * Normalize one JSON-Schema-shaped tool input into the comparable model.
  * `root` defaults to the schema itself; pass the enclosing document when the
  * schema lives inside one (e.g. an OpenAPI components tree).
@@ -97,31 +225,11 @@ export function renderedToolFromJsonSchema(
 ): RenderedTool {
   const doc = root ?? inputSchema;
   const schema = resolveRef(inputSchema, doc) ?? {};
-  const rawProperties = isRecord(schema.properties) ? schema.properties : {};
-  const requiredNames = Array.isArray(schema.required) ? schema.required.map(String) : [];
-  const hasRootUnion = Array.isArray(schema.anyOf) || Array.isArray(schema.oneOf);
-
-  const properties: RenderedProperty[] = Object.entries(rawProperties).map(
-    ([propertyName, rawSchema]) => {
-      const resolved = resolveRef(rawSchema, doc);
-      if (resolved === null) {
-        return {
-          constraints: {},
-          description: null,
-          name: propertyName,
-          required: requiredNames.includes(propertyName),
-          type: null,
-        };
-      }
-      return {
-        constraints: extractConstraints(resolved),
-        description: typeof resolved.description === 'string' ? resolved.description : null,
-        name: propertyName,
-        required: requiredNames.includes(propertyName),
-        type: effectiveType(resolved, doc),
-      };
-    },
-  );
-
-  return { description, hasRootUnion, name, properties, requiredNames };
+  return {
+    description,
+    hasRootUnion: Array.isArray(schema.anyOf) || Array.isArray(schema.oneOf),
+    name,
+    properties: propertiesOf(schema, doc, 0, new Set([schema])),
+    requiredNames: requiredNamesOf(schema),
+  };
 }

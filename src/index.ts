@@ -15,6 +15,7 @@ export { CrosscheckUsageError, runCrosscheck } from './run.js';
 export {
   CONSTRAINT_KEYWORDS,
   effectiveType,
+  renderedPropertiesFromJsonSchema,
   renderedToolFromJsonSchema,
   resolveRef,
 } from './schema.js';
