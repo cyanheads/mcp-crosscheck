@@ -1,7 +1,7 @@
 <div align="center">
   <h1>mcp-crosscheck</h1>
   <p><b>Run real MCP clients against your server and diff what they render against what you advertise.</b></p>
-  <p>Deterministic — no LLM calls, no API keys, no accounts. Every check is a process spawn and a JSON read.</p>
+  <p>Deterministic — no LLM calls, no API keys.</p>
 </div>
 
 <div align="center">
@@ -12,58 +12,50 @@
 
 ---
 
-Your MCP server advertises tools over `tools/list`. Each client then re-renders that JSON Schema into its own model — an OpenAPI request body, an OpenAI function schema, a Gemini declaration — and every converter silently drops or mangles what it doesn't handle. Server test suites validate what you advertise; nothing validates what clients actually render. That gap ships real bugs:
+Your server advertises tools over `tools/list`. Every client re-renders that JSON Schema into its own model (an OpenAPI request body, an OpenAI function schema) and each converter silently drops what it doesn't handle: union parameters render with no type, fields declared inside `anyOf` branches collapse into an empty request body, `enum` and numeric bounds vanish. Your test suite validates what you advertise. Nothing validates what clients actually render.
 
-- [obsidian-mcp-server#91](https://github.com/cyanheads/obsidian-mcp-server/issues/91) — mcpo's converter had no `oneOf` branch, so a discriminated-union parameter rendered with no type at all, and every downstream layer coerced it to a string.
-- [openstreetmap-mcp-server#57](https://github.com/cyanheads/openstreetmap-mcp-server/issues/57) — mcpo builds request models from `properties`/`required` only, so fields declared inside root `anyOf` branches produced `requestBody: null` and every argument was silently dropped.
-
-`mcp-crosscheck` closes the gap. It boots your built server, captures ground truth with the official [MCP TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk) client, launches real third-party clients at their latest released versions against the same server, and diffs each client's rendered surface against ground truth. It catches drift in both directions: a schema idiom you ship that a converter mangles, and a converter release that breaks rendering with no change on your side.
+`mcp-crosscheck` closes that gap. It captures ground truth with the official [MCP TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk) client, launches real clients at their latest released versions against the same server, and diffs each rendered surface against ground truth — catching both the schema idiom a converter mangles and the converter release that breaks rendering with no change on your side.
 
 ## Quick start
 
 ```sh
-# stdio server — canary names a safe tool to round-trip, with exact args
-bunx mcp-crosscheck \
-  --env MCP_LOG_LEVEL=error \
-  --canary 'echo_message={"message":"probe"}' \
-  -- node ./dist/index.js
+# stdio server — the canary names a safe tool to round-trip, with exact args
+npx mcp-crosscheck --canary 'echo_message={"message":"probe"}' -- node ./dist/index.js
 
 # already-running streamable-http server
-bunx mcp-crosscheck --http https://example.com/mcp
+npx mcp-crosscheck --http https://example.com/mcp
 
 # opt in to the Codex adapter
-bunx mcp-crosscheck --adapters inspector,mcpo,codex -- node ./dist/index.js
+npx mcp-crosscheck --adapters inspector,mcpo,codex -- node ./dist/index.js
 ```
 
-`npx mcp-crosscheck` works identically — the CLI runs on Node ≥ 22, no Bun required. The mcpo adapter needs [`uv`](https://docs.astral.sh/uv/) on PATH; the inspector and codex adapters resolve through `npx`.
+Runs on Node ≥ 22; `bunx` works identically. The mcpo adapter needs [`uv`](https://docs.astral.sh/uv/) on PATH. Exit codes: `0` pass · `1` failures · `2` usage error.
 
-Real output against a live server (mcp-ts-core's examples server, 2026-08-09):
+Real output, against this repo's bundled fixture server — six tools whose schemas are built to break converters — with mcpo pinned past its import-broken latest:
 
 ```
-mcp-crosscheck v0.0.1 → example-mcp-server@0.1.0 (6 tools advertised)
+mcp-crosscheck v0.0.2 → crosscheck-fixture-server@1.0.0 (6 tools advertised)
 
-inspector (v2.1.0, 3.8s) PASS
+inspector (v2.1.0, 2.9s) PASS
   rendered 6/6 tools
   canary: round-trip ok
   no divergence from ground truth
 
-mcpo (v0.0.20, 1.5s) PASS
+mcpo (v0.0.20, 1.6s) 3 FAIL
   rendered 6/6 tools
   canary: round-trip ok
-  info [constraint-dropped] template_echo_message.message constraint keywords dropped: maxLength, minLength
-  info [constraint-dropped] template_echo_message.mode constraint keyword dropped: enum
+  FAIL [empty-request-body] branch_only_fields ground truth advertises 2 input properties, declared inside anyOf/oneOf branches, but the client rendered an empty request body — every argument would be dropped
+  FAIL [property-untyped] typed_edges.kind property rendered with no type information (ground truth: enum<string>)
+  FAIL [property-untyped] typed_edges.version property rendered with no type information (ground truth: const<number>)
+  info [constraint-dropped] echo_message.mode constraint keyword dropped: enum
+  info [constraint-dropped] nested_config.config.transport.timeoutMs constraint keyword dropped: minimum
+  info [anyof-ignored] union_modes root anyOf/oneOf union is not represented in the rendered surface — the client cannot enforce which branch applies (fields declared inside the branches are compared as properties)
   ...
 
-codex (v0.147.0, 2.8s) PASS
-  rendered 6/6 tools
-  canary: skipped — codex adapter is capture-only
-  info [constraint-dropped] template_echo_message.message constraint keywords dropped: maxLength, minLength
-  ...
-
-PASS — 3 adapter(s), 11 info note(s)
+FAIL — 3 failure(s), 9 info note(s) across 2 adapter(s)
 ```
 
-The same run already tells you things the docs of those clients don't: mcpo drops `enum` from rendered models, Codex keeps `enum` but strips `minimum`/`maximum`, and both lose string length bounds. Exit codes: `0` pass · `1` failures · `2` usage error.
+One converter, one run: arguments that would silently vanish, properties stripped of their types, and constraint erosion down to depth three — none of it visible from the server's own tests.
 
 ## What it checks
 
@@ -71,10 +63,12 @@ Two severity tiers. `fail` is divergence that breaks agents in the wild; `info` 
 
 | Tier | Invariants |
 |:--|:--|
-| **fail** | tool missing from the rendered surface · property missing · property rendered with no type information · tool or property description lost · root `required` dropped · empty request body for a tool that advertises properties · canary round-trip fails through the adapter · MCP handshake failure · `adapter-broken` (the client itself failed to launch, reported with its resolved version) |
-| **info** | dropped constraint keywords (`minimum`, `maximum`, `pattern`, `format`, `enum`, `minLength`, `maxLength`, `additionalProperties`, …) · root `anyOf`/`oneOf` union a client ignores rather than enforces |
+| **fail** | tool missing from the rendered surface · property missing, including fields declared only inside an `anyOf`/`oneOf` branch · property rendered with no type information · tool or property description lost · `required` dropped at the level that declares it · empty request body for a tool that advertises properties, or a nested object rendered with none of its fields · canary round-trip fails through the adapter · MCP handshake failure · `adapter-broken` (the client itself failed to launch, reported with its resolved version) |
+| **info** | dropped constraint keywords (`minimum`, `maximum`, `pattern`, `format`, `enum`, `minLength`, `maxLength`, `additionalProperties`, …) · root `anyOf`/`oneOf` union a client ignores rather than enforces · a field of an advertised `outputSchema` the client's rendered result model drops or renders untyped |
 
-The canary is never synthesized: you name one safe tool and its exact arguments, crosscheck verifies the call against ground truth first, and only then round-trips it through each adapter. A canary that fails against your own server is a usage error, not a client bug.
+The property rules run at every level, not just root: nested objects and array elements are compared the same way, each finding scoped by path — `connect.config.transport.timeoutMs`, with `[]` for elements. Fields declared only inside `anyOf`/`oneOf` branches are collected on both sides before the diff, so a converter that reads `properties` alone is caught dropping them instead of passing with an empty request body. An advertised `outputSchema` is walked to the same depth under an `output:` prefix, info-tier throughout: a lost output field misleads a model about what a call returns, but drops no argument.
+
+The canary is never synthesized. You name one safe tool and its exact arguments, crosscheck verifies the call against your own server first, then round-trips it through each adapter. Arguments reach each client verbatim, integers and empty strings included; where a client's encoding cannot express them (a `--pin`ned MCP Inspector before 2.0.0), the round-trip reports skipped, not failed.
 
 ## Adapters
 
@@ -84,7 +78,7 @@ The canary is never synthesized: you name one safe tool and its exact arguments,
 | [mcpo](https://github.com/open-webui/mcpo) | `uvx mcpo` | generated `openapi.json` + live POST canary | open-webui's MCP → OpenAPI proxy. stdio and streamable-http. |
 | [Codex CLI](https://github.com/openai/codex) | `npx @openai/codex exec` under a throwaway `CODEX_HOME` | intercepted Responses API request body | **Opt-in.** stdio targets. Capture-only (no canary). |
 
-**Latest floats by design.** Adapters resolve `@latest` at run time — a crosscheck run is a canary, not a reproducible build gate. When an upstream release breaks, that is a finding, not noise: as of this release, a fresh `uvx mcpo` resolve fails at import because mcpo leaves its `mcp` dependency unbounded and the Python SDK v2 removed a symbol it uses. crosscheck classifies that as `adapter-broken` with the resolved version, and two escape hatches keep one broken upstream from blinding the rest of a run:
+**Latest floats by design.** Adapters resolve `@latest` at run time: a crosscheck run is a canary, not a reproducible build gate, so a broken upstream release is a finding (`adapter-broken`, with the resolved version), not noise. Two escape hatches keep one broken upstream from blinding a run:
 
 ```sh
 mcp-crosscheck --pin mcpo=0.0.20 --mcpo-with 'mcp<2' -- node ./dist/index.js
@@ -92,9 +86,7 @@ mcp-crosscheck --pin mcpo=0.0.20 --mcpo-with 'mcp<2' -- node ./dist/index.js
 
 ### The Codex adapter
 
-Codex ships no introspection command — `codex mcp` covers list/get/add/remove, none of which show how Codex renders your schemas. The adapter reads through a provider intercept instead: it runs a real `codex exec` under a throwaway `CODEX_HOME` whose model provider points at a local stub server, and Codex's first Responses API request carries its converted `tools` array — Codex's exact rendered view of your server — before any model reply matters. The moment a tools-bearing request is captured, the Codex process is torn down.
-
-No login is required, nothing reaches OpenAI, and zero tokens are spent. It is opt-in (`--adapters ...,codex`) because it boots the full Codex binary and reads a request shape Codex doesn't guarantee; a native `codex mcp tools --json` upstream would replace it.
+Codex ships no schema introspection, so the adapter reads through a provider intercept: a real `codex exec` runs under a throwaway `CODEX_HOME` whose model provider points at a local stub, and Codex's first Responses API request carries its converted `tools` array — its exact rendered view of your server. The process is torn down the moment that request is captured. No login, nothing reaches OpenAI, zero tokens spent. It stays opt-in because it boots the full Codex binary and reads a request shape Codex doesn't guarantee.
 
 ## CLI reference
 
@@ -116,18 +108,18 @@ mcp-crosscheck --http <url> [flags]               running streamable-http server
 
 ## CI usage
 
-Because latest floats, crosscheck belongs in an opt-in or scheduled lane, not your default reproducible gate:
+Latest floats, so crosscheck belongs in an opt-in or scheduled lane, not your default reproducible gate:
 
 ```jsonc
 // package.json
 {
   "scripts": {
-    "compat": "mcp-crosscheck --env MCP_LOG_LEVEL=error --canary 'echo_message={\"message\":\"probe\"}' -- node ./dist/index.js"
+    "compat": "mcp-crosscheck --canary 'echo_message={\"message\":\"probe\"}' -- node ./dist/index.js"
   }
 }
 ```
 
-A scheduled run surfaces converter regressions the day they land — including breakage entirely on the client's side. `--json` emits a stable report shape for scripted consumers, and the process exit code alone is enough for a pass/fail gate.
+A scheduled run surfaces converter regressions the day they land, including breakage entirely on the client's side. `--json` emits a stable report shape; the exit code alone is enough for a pass/fail gate.
 
 ## Programmatic API
 
@@ -137,12 +129,7 @@ import { runCrosscheck } from 'mcp-crosscheck';
 const report = await runCrosscheck({
   adapters: ['inspector', 'mcpo'],
   canary: { tool: 'echo_message', args: { message: 'probe' } },
-  target: {
-    kind: 'stdio',
-    command: 'node',
-    args: ['./dist/index.js'],
-    env: { MCP_LOG_LEVEL: 'error' },
-  },
+  target: { kind: 'stdio', command: 'node', args: ['./dist/index.js'], env: {} },
 });
 
 console.log(report.pass, report.failCount, report.adapters);
@@ -150,36 +137,14 @@ console.log(report.pass, report.failCount, report.adapters);
 
 The pieces are exported individually too: `captureGroundTruth`, `compareSurface`, `surfaceFromOpenApiDoc`, `surfaceFromCodexBody`, `renderHumanReport`.
 
-## Roadmap
-
-- Gemini CLI adapter — headless `gemini mcp list` reports connection status only today; a provider intercept like the Codex adapter's may expose the converted function declarations.
-- Codex adapter support for streamable-http targets.
-- Nested-schema comparison below root properties.
-
 ## Development
 
 ```sh
 bun install
 bun run devcheck   # format + lint (zero warnings), typecheck, build, tests, package sanity
-bun test
 ```
 
-CI is local-first: `devcheck` is the gate, run before every commit.
-
-Tests run against a bundled fixture server (`tests/fixture-server/`) whose schemas are hand-written JSON Schema literals picked to break converters: a root `anyOf`, fields declared only inside branches, two levels of nesting, an `enum` with no `type`, a `const`, a `type` array, and a zero-argument tool. Run it standalone with `bun run fixture-server`, or over streamable-http with `MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=8901 bun run fixture-server`.
-
-`bun test` is hermetic: the default lanes exercise the engine, the adapter failure paths (through an injectable process seam), and the real CLI end to end, with no network and no binaries beyond bun. Lanes that resolve real clients at latest are opt-in:
-
-| Lane | Gate |
-|:--|:--|
-| inspector, mcpo | `CROSSCHECK_E2E_NETWORK=1` — mcpo additionally needs [`uv`](https://docs.astral.sh/uv/) on PATH |
-| codex | `CROSSCHECK_E2E_CODEX=1` — boots the full Codex binary, minutes not seconds |
-
-```sh
-CROSSCHECK_E2E_NETWORK=1 bun test tests/e2e.test.ts
-```
-
-A skipped lane prints what enables it — the gate variable, or the missing prerequisite.
+Tests run hermetically against a bundled fixture server (`tests/fixture-server/`) whose hand-written schemas are picked to break converters: a root `anyOf`, branch-only fields, two levels of nesting, a nested `outputSchema`, an `enum` with no `type`, a `const`, a `type` array, a zero-argument tool. Lanes that resolve real clients at latest are opt-in — `CROSSCHECK_E2E_NETWORK=1` for inspector and mcpo (mcpo also needs `uv`), `CROSSCHECK_E2E_CODEX=1` for Codex (boots the full binary, minutes not seconds). A skipped lane prints what enables it.
 
 ## License
 
