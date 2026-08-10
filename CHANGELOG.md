@@ -2,6 +2,17 @@
 
 All notable changes to mcp-crosscheck are documented here.
 
+## 0.0.3 — 2026-08-09
+
+Engine depth.
+
+- Nested comparison: object fields and array elements are now diffed at every depth, not just root — each finding scoped by path (`tool.config.transport.timeoutMs`, `[]` for array elements). A depth limit plus a visited-ref set guarantee termination on a structurally recursive schema.
+- Branch-declared fields: properties declared only inside an `anyOf`/`oneOf` branch are collected and compared on both sides, closing the class of bug where a tool with only branch-declared fields rendered as an empty request body and silently dropped every argument.
+- `outputSchema` comparison: an advertised output schema is walked to the same depth under an `output:` path prefix, entirely at info tier — a lost or untyped output field misleads a model about what a call returns, but drops no argument.
+- Inspector canary arguments now encode as a single `--tool-args-json` object instead of per-key `--tool-arg`, so integers, booleans, and empty strings reach the client verbatim; a pinned inspector before 2.0.0 (no `--tool-args-json`) reports the round-trip skipped rather than mangling an argument it can't spell as text.
+- Fixed `required-dropped` to check branch-declared nested fields — a nested level whose own `required` names a field declared only inside an `anyOf`/`oneOf` branch no longer skips it.
+- README rewrite: trimmed intro, captured fixture-server demo output in place of the roadmap section, and the new nested/branch/output-schema invariant rows folded in.
+
 ## 0.0.2 — 2026-08-09
 
 Test bed.
