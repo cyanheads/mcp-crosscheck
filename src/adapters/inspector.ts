@@ -15,7 +15,7 @@ import type {
   RenderedSurface,
   TargetSpec,
 } from '../types.js';
-import { excerpt, execCapture } from '../util/exec.js';
+import { type Exec, excerpt, nodeExec } from '../util/exec.js';
 import { npmLatestVersion } from '../util/versions.js';
 
 const ListToolsOutput = z.object({
@@ -65,25 +65,25 @@ function parseJsonLoose(stdout: string): unknown {
   }
 }
 
-function resolveVersion(ctx: AdapterContext): Promise<string | null> {
+function resolveVersion(ctx: AdapterContext, exec: Exec): Promise<string | null> {
   const pin = ctx.pins.inspector;
   if (pin !== undefined) return Promise.resolve(pin);
   // The inspector binary has no --version flag — a bare invocation launches
   // its UI server and never exits — so latest resolves via the registry.
-  return npmLatestVersion('@modelcontextprotocol/inspector', ctx.workDir);
+  return npmLatestVersion('@modelcontextprotocol/inspector', ctx.workDir, exec);
 }
 
 function serializeToolArg(value: unknown): string {
   return typeof value === 'string' ? value : JSON.stringify(value);
 }
 
-async function runCanary(ctx: AdapterContext): Promise<CanaryOutcome | null> {
+async function runCanary(ctx: AdapterContext, exec: Exec): Promise<CanaryOutcome | null> {
   if (ctx.canary === null) return null;
   const argFlags = Object.entries(ctx.canary.args).flatMap(([key, value]) => [
     '--tool-arg',
     `${key}=${serializeToolArg(value)}`,
   ]);
-  const result = await execCapture(
+  const result = await exec.capture(
     'npx',
     [...baseArgs(ctx), '--method', 'tools/call', '--tool-name', ctx.canary.tool, ...argFlags],
     { cwd: ctx.workDir, timeoutMs: ctx.timeoutMs },
@@ -109,10 +109,11 @@ async function runCanary(ctx: AdapterContext): Promise<CanaryOutcome | null> {
 
 async function run(ctx: AdapterContext): Promise<AdapterRunResult> {
   const startedAt = Date.now();
-  const resolvedVersion = await resolveVersion(ctx);
+  const exec = ctx.exec ?? nodeExec;
+  const resolvedVersion = await resolveVersion(ctx, exec);
   ctx.log(`inspector: resolved ${resolvedVersion ?? 'unknown version'}, listing tools`);
 
-  const result = await execCapture('npx', [...baseArgs(ctx), '--method', 'tools/list'], {
+  const result = await exec.capture('npx', [...baseArgs(ctx), '--method', 'tools/list'], {
     cwd: ctx.workDir,
     timeoutMs: ctx.timeoutMs,
   });
@@ -152,7 +153,7 @@ async function run(ctx: AdapterContext): Promise<AdapterRunResult> {
     ),
   };
 
-  const canary = await runCanary(ctx);
+  const canary = await runCanary(ctx, exec);
   return finish({ canary, status: 'ok', statusDetail: null, surface });
 }
 

@@ -14,7 +14,7 @@ import type {
   RenderedTool,
   TargetSpec,
 } from '../types.js';
-import { excerpt, execCapture, spawnManaged } from '../util/exec.js';
+import { type Exec, excerpt, nodeExec } from '../util/exec.js';
 import { fetchJson, getFreePort, waitForReady } from '../util/net.js';
 import { pypiLatestVersion } from '../util/versions.js';
 
@@ -70,11 +70,11 @@ function toolFromPath(path: string, item: unknown, doc: unknown): RenderedTool |
   return renderedToolFromJsonSchema(name, description, schema, doc);
 }
 
-async function resolveVersion(ctx: AdapterContext): Promise<string | null> {
+async function resolveVersion(ctx: AdapterContext, exec: Exec): Promise<string | null> {
   const pin = ctx.pins.mcpo;
   if (pin !== undefined) return pin;
   const withFlags = ctx.mcpoWith.flatMap((constraint) => ['--with', constraint]);
-  const result = await execCapture('uvx', [...withFlags, packageSpec(ctx), '--version'], {
+  const result = await exec.capture('uvx', [...withFlags, packageSpec(ctx), '--version'], {
     cwd: ctx.workDir,
     timeoutMs: Math.min(ctx.timeoutMs, 120_000),
   });
@@ -106,12 +106,13 @@ async function runCanary(ctx: AdapterContext, port: number): Promise<CanaryOutco
 
 async function run(ctx: AdapterContext): Promise<AdapterRunResult> {
   const startedAt = Date.now();
-  const resolvedVersion = await resolveVersion(ctx);
+  const exec = ctx.exec ?? nodeExec;
+  const resolvedVersion = await resolveVersion(ctx, exec);
   const port = await getFreePort();
   ctx.log(`mcpo: resolved ${resolvedVersion ?? 'unknown version'}, proxy on :${port}`);
 
   const env = ctx.target.kind === 'stdio' ? ctx.target.env : {};
-  const proc = spawnManaged('uvx', uvxArgs(ctx, port), { cwd: ctx.workDir, env });
+  const proc = exec.spawn('uvx', uvxArgs(ctx, port), { cwd: ctx.workDir, env });
 
   const finish = (partial: Omit<AdapterRunResult, 'adapter' | 'durationMs' | 'resolvedVersion'>) =>
     ({

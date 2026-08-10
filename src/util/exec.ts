@@ -3,6 +3,9 @@
  * Process helpers: bounded one-shot execution with output capture, and managed
  * long-running children. Both spawn detached process groups on POSIX so that
  * package-runner wrappers (npx, uvx) and their children die together.
+ *
+ * The `Exec` interface is the injection seam for all of it: adapters resolve
+ * `ctx.exec ?? nodeExec`, so tests substitute fakes and never spawn processes.
  */
 import { type ChildProcess, spawn } from 'node:child_process';
 
@@ -138,6 +141,23 @@ export function spawnManaged(
     stdoutTail: () => stdoutTail,
   };
 }
+
+/**
+ * The seam every adapter runs its child processes through. Swapping it lets
+ * failure-path classification be tested without breaking a real upstream; it is
+ * not an abstraction layer, so it carries exactly the two calls `exec.ts` offers.
+ */
+export interface Exec {
+  capture(command: string, args: string[], opts: ExecOptions): Promise<ExecResult>;
+  spawn(
+    command: string,
+    args: string[],
+    opts: { cwd?: string; env?: Record<string, string> },
+  ): ManagedProcess;
+}
+
+/** Real child processes — the default for every adapter run. */
+export const nodeExec: Exec = { capture: execCapture, spawn: spawnManaged };
 
 /** Compress process output into a short single-line excerpt for findings and status detail. */
 export function excerpt(text: string, maxLength = 400): string {

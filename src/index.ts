@@ -19,4 +19,6 @@ export {
   resolveRef,
 } from './schema.js';
 export type * from './types.js';
+export type { Exec, ExecResult } from './util/exec.js';
+export { nodeExec } from './util/exec.js';
 export { VERSION } from './version.js';

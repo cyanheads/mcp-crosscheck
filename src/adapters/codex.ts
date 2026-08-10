@@ -26,7 +26,7 @@ import type {
   RenderedTool,
   TargetSpec,
 } from '../types.js';
-import { excerpt, execCapture, spawnManaged } from '../util/exec.js';
+import { type Exec, excerpt, nodeExec } from '../util/exec.js';
 import { getFreePort } from '../util/net.js';
 import { npmLatestVersion } from '../util/versions.js';
 
@@ -160,16 +160,16 @@ function startCaptureServer(port: number): Promise<CaptureServer> {
   });
 }
 
-async function resolveVersion(ctx: AdapterContext): Promise<string | null> {
+async function resolveVersion(ctx: AdapterContext, exec: Exec): Promise<string | null> {
   const pin = ctx.pins.codex;
   if (pin !== undefined) return pin;
-  const result = await execCapture('npx', ['-y', packageSpec(ctx), '--version'], {
+  const result = await exec.capture('npx', ['-y', packageSpec(ctx), '--version'], {
     cwd: ctx.workDir,
     timeoutMs: Math.min(ctx.timeoutMs, 180_000),
   });
   const match = result.stdout.trim().match(/\d+\.\d+\.\d+[^\s]*/);
   if (match !== null) return match[0];
-  return npmLatestVersion('@openai/codex', ctx.workDir);
+  return npmLatestVersion('@openai/codex', ctx.workDir, exec);
 }
 
 async function run(ctx: AdapterContext): Promise<AdapterRunResult> {
@@ -179,14 +179,15 @@ async function run(ctx: AdapterContext): Promise<AdapterRunResult> {
   }
   const target = ctx.target;
 
-  const resolvedVersion = await resolveVersion(ctx);
+  const exec = ctx.exec ?? nodeExec;
+  const resolvedVersion = await resolveVersion(ctx, exec);
   const port = await getFreePort();
   const codexHome = await mkdtemp(join(ctx.workDir, 'codex-home-'));
   await writeFile(join(codexHome, 'config.toml'), buildConfigToml(target, port));
   ctx.log(`codex: resolved ${resolvedVersion ?? 'unknown version'}, intercept on :${port}`);
 
   const capture = await startCaptureServer(port);
-  const proc = spawnManaged(
+  const proc = exec.spawn(
     'npx',
     ['-y', packageSpec(ctx), 'exec', '--skip-git-repo-check', 'ping'],
     {

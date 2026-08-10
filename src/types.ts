@@ -4,6 +4,7 @@
  * the normalized rendered surface each client produces, and the findings the
  * invariant engine emits when the two disagree.
  */
+import type { Exec } from './util/exec.js';
 
 /** A loose JSON Schema object, as advertised in `tools/list`. */
 export type JsonSchema = Record<string, unknown>;
@@ -101,6 +102,8 @@ export interface AdapterContext {
   /** Directory to persist raw captures into, or null to discard them. */
   artifactsDir: string | null;
   canary: CanarySpec | null;
+  /** Process-execution seam; omitted means real child processes. */
+  exec?: Exec;
   log: (line: string) => void;
   /** Extra `uvx --with` dependency constraints for the mcpo adapter (e.g. `mcp<2`). */
   mcpoWith: string[];

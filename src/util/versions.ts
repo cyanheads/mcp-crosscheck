@@ -4,11 +4,15 @@
  * what it actually exercised: pins short-circuit, registry lookups are
  * best-effort and bounded, and null degrades to "version unresolved".
  */
-import { execCapture } from './exec.js';
+import type { Exec } from './exec.js';
 
 /** Latest published version of an npm package, via `npm view`. */
-export async function npmLatestVersion(pkg: string, workDir: string): Promise<string | null> {
-  const result = await execCapture('npm', ['view', pkg, 'version'], {
+export async function npmLatestVersion(
+  pkg: string,
+  workDir: string,
+  exec: Exec,
+): Promise<string | null> {
+  const result = await exec.capture('npm', ['view', pkg, 'version'], {
     cwd: workDir,
     timeoutMs: 15_000,
   });
@@ -16,7 +20,11 @@ export async function npmLatestVersion(pkg: string, workDir: string): Promise<st
   return match?.[0] ?? null;
 }
 
-/** Latest published version of a PyPI package, via the JSON API. */
+/**
+ * Latest published version of a PyPI package, via the JSON API. This is a live
+ * `fetch` outside the Exec seam — tests that exercise unpinned mcpo paths must
+ * pin the version so this fallback stays unreachable.
+ */
 export async function pypiLatestVersion(pkg: string, timeoutMs = 10_000): Promise<string | null> {
   try {
     const response = await fetch(`https://pypi.org/pypi/${pkg}/json`, {
