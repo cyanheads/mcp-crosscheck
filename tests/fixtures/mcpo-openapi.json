@@ -1,0 +1,724 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "example-mcp-server",
+    "description": "example-mcp-server MCP Server",
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/template_cat_fact": {
+      "post": {
+        "summary": "Template Cat Fact",
+        "description": "Fetch a random cat fact from a public API. Optionally cap its character length.",
+        "operationId": "tool_template_cat_fact_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/template_cat_fact_form_model"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/template_cat_fact_response_model"
+                    },
+                    {}
+                  ],
+                  "title": "Response Tool Template Cat Fact Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/template_echo_message": {
+      "post": {
+        "summary": "Template Echo Message",
+        "description": "Echo a message back with optional formatting and repetition.",
+        "operationId": "tool_template_echo_message_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/template_echo_message_form_model"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/template_echo_message_response_model"
+                    },
+                    {}
+                  ],
+                  "title": "Response Tool Template Echo Message Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/template_image_test": {
+      "post": {
+        "summary": "Template Image Test",
+        "description": "Fetch a random cat image and return it base64-encoded with its MIME type.",
+        "operationId": "tool_template_image_test_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/template_image_test_form_model"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/template_image_test_response_model"
+                    },
+                    {}
+                  ],
+                  "title": "Response Tool Template Image Test Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/template_madlibs_elicitation": {
+      "post": {
+        "summary": "Template Madlibs Elicitation",
+        "description": "Combine a noun, verb, and adjective into a one-line Mad Libs story. Any parts of speech omitted from the input are requested from the user during execution.",
+        "operationId": "tool_template_madlibs_elicitation_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/template_madlibs_elicitation_form_model"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/template_madlibs_elicitation_response_model"
+                    },
+                    {}
+                  ],
+                  "title": "Response Tool Template Madlibs Elicitation Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/template_async_countdown": {
+      "post": {
+        "summary": "Template Async Countdown",
+        "description": "Run a countdown timer for the requested number of seconds, reporting progress as it ticks. Cancellable mid-run. On task-capable clients the call returns immediately and progress streams over the task channel; otherwise it runs synchronously and returns when the countdown finishes.",
+        "operationId": "tool_template_async_countdown_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/template_async_countdown_form_model"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/template_async_countdown_response_model"
+                    },
+                    {}
+                  ],
+                  "title": "Response Tool Template Async Countdown Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/template_data_explorer": {
+      "post": {
+        "summary": "Template Data Explorer",
+        "description": "Generate sample sales data and render an interactive table. Users can sort columns, filter rows, and select entries from the UI. Falls back to a plain text table where interactive UI is not available.",
+        "operationId": "tool_template_data_explorer_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/template_data_explorer_form_model"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/template_data_explorer_response_model"
+                    },
+                    {}
+                  ],
+                  "title": "Response Tool Template Data Explorer Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      },
+      "template_async_countdown_form_model": {
+        "properties": {
+          "seconds": {
+            "type": "integer",
+            "title": "Seconds",
+            "description": "Number of seconds to count down (1-60)"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message",
+            "description": "Optional message to include in the final result"
+          },
+          "simulateFailure": {
+            "type": "boolean",
+            "title": "Simulatefailure",
+            "description": "Force a failure at 50% progress.",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "seconds"
+        ],
+        "title": "template_async_countdown_form_model"
+      },
+      "template_async_countdown_response_model": {
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "title": "Success",
+            "description": "Whether the countdown completed successfully"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message",
+            "description": "Completion or cancellation message"
+          },
+          "startedAt": {
+            "type": "string",
+            "title": "Startedat",
+            "description": "ISO timestamp when countdown started"
+          },
+          "completedAt": {
+            "type": "string",
+            "title": "Completedat",
+            "description": "ISO timestamp when countdown ended"
+          },
+          "duration": {
+            "type": "number",
+            "title": "Duration",
+            "description": "Actual duration in milliseconds"
+          },
+          "progress": {
+            "type": "number",
+            "title": "Progress",
+            "description": "Final progress percentage (0-100)"
+          },
+          "wasCancelled": {
+            "type": "boolean",
+            "title": "Wascancelled",
+            "description": "Whether the task was cancelled"
+          }
+        },
+        "type": "object",
+        "required": [
+          "success",
+          "message",
+          "startedAt",
+          "completedAt",
+          "duration",
+          "progress",
+          "wasCancelled"
+        ],
+        "title": "template_async_countdown_response_model"
+      },
+      "template_cat_fact_form_model": {
+        "properties": {
+          "maxLength": {
+            "type": "integer",
+            "title": "Maxlength",
+            "description": "Maximum character length of the returned fact."
+          }
+        },
+        "type": "object",
+        "title": "template_cat_fact_form_model"
+      },
+      "template_cat_fact_response_model": {
+        "properties": {
+          "fact": {
+            "type": "string",
+            "title": "Fact",
+            "description": "The retrieved cat fact."
+          },
+          "length": {
+            "type": "integer",
+            "title": "Length",
+            "description": "The character length of the cat fact."
+          },
+          "requestedMaxLength": {
+            "type": "integer",
+            "title": "Requestedmaxlength",
+            "description": "The maximum length that was requested for the fact."
+          },
+          "timestamp": {
+            "type": "string",
+            "title": "Timestamp",
+            "description": "ISO 8601 timestamp of when the response was generated."
+          }
+        },
+        "type": "object",
+        "required": [
+          "fact",
+          "length",
+          "timestamp"
+        ],
+        "title": "template_cat_fact_response_model"
+      },
+      "template_data_explorer_form_model": {
+        "properties": {
+          "rowCount": {
+            "type": "integer",
+            "title": "Rowcount",
+            "description": "Number of sample rows to generate (5-100).",
+            "default": 20
+          }
+        },
+        "type": "object",
+        "title": "template_data_explorer_form_model"
+      },
+      "template_data_explorer_response_model": {
+        "properties": {
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/template_data_explorer_response_model_rows_item_model"
+            },
+            "type": "array",
+            "title": "Rows",
+            "description": "Generated sales data rows."
+          },
+          "generatedAt": {
+            "type": "string",
+            "title": "Generatedat",
+            "description": "ISO 8601 timestamp when data was generated."
+          },
+          "summary": {
+            "$ref": "#/components/schemas/template_data_explorer_response_model_summary_model",
+            "description": "Aggregate summary of the dataset."
+          }
+        },
+        "type": "object",
+        "required": [
+          "rows",
+          "generatedAt",
+          "summary"
+        ],
+        "title": "template_data_explorer_response_model"
+      },
+      "template_data_explorer_response_model_rows_item_model": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id",
+            "description": "Unique row identifier."
+          },
+          "region": {
+            "type": "string",
+            "title": "Region",
+            "description": "Sales region name."
+          },
+          "product": {
+            "type": "string",
+            "title": "Product",
+            "description": "Product name."
+          },
+          "units": {
+            "type": "integer",
+            "title": "Units",
+            "description": "Units sold."
+          },
+          "revenue": {
+            "type": "number",
+            "title": "Revenue",
+            "description": "Revenue in USD."
+          },
+          "date": {
+            "type": "string",
+            "title": "Date",
+            "description": "Sale date (YYYY-MM-DD)."
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "region",
+          "product",
+          "units",
+          "revenue",
+          "date"
+        ],
+        "title": "template_data_explorer_response_model_rows_item_model"
+      },
+      "template_data_explorer_response_model_summary_model": {
+        "properties": {
+          "totalRows": {
+            "type": "integer",
+            "title": "Totalrows",
+            "description": "Total number of rows."
+          },
+          "totalRevenue": {
+            "type": "number",
+            "title": "Totalrevenue",
+            "description": "Sum of all revenue."
+          },
+          "totalUnits": {
+            "type": "integer",
+            "title": "Totalunits",
+            "description": "Sum of all units sold."
+          }
+        },
+        "type": "object",
+        "required": [
+          "totalRows",
+          "totalRevenue",
+          "totalUnits"
+        ],
+        "title": "template_data_explorer_response_model_summary_model"
+      },
+      "template_echo_message_form_model": {
+        "properties": {
+          "message": {
+            "type": "string",
+            "title": "Message",
+            "description": "The message to echo back."
+          },
+          "mode": {
+            "type": "string",
+            "title": "Mode",
+            "description": "How to format the message before repetition. `standard` returns it unchanged.",
+            "default": "standard"
+          },
+          "repeat": {
+            "type": "integer",
+            "title": "Repeat",
+            "description": "Number of times to repeat the formatted message.",
+            "default": 1
+          },
+          "includeTimestamp": {
+            "type": "boolean",
+            "title": "Includetimestamp",
+            "description": "Whether to include an ISO 8601 timestamp in the response.",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "message"
+        ],
+        "title": "template_echo_message_form_model"
+      },
+      "template_echo_message_response_model": {
+        "properties": {
+          "originalMessage": {
+            "type": "string",
+            "title": "Originalmessage",
+            "description": "The original message provided in the input."
+          },
+          "formattedMessage": {
+            "type": "string",
+            "title": "Formattedmessage",
+            "description": "The message after applying the specified formatting."
+          },
+          "repeatedMessage": {
+            "type": "string",
+            "title": "Repeatedmessage",
+            "description": "The final message repeated the requested number of times."
+          },
+          "mode": {
+            "type": "string",
+            "title": "Mode",
+            "description": "The formatting mode that was applied."
+          },
+          "repeatCount": {
+            "type": "integer",
+            "title": "Repeatcount",
+            "description": "The number of times the message was repeated."
+          },
+          "timestamp": {
+            "type": "string",
+            "title": "Timestamp",
+            "description": "ISO 8601 timestamp of when the response was generated. Present when `includeTimestamp` is true."
+          }
+        },
+        "type": "object",
+        "required": [
+          "originalMessage",
+          "formattedMessage",
+          "repeatedMessage",
+          "mode",
+          "repeatCount"
+        ],
+        "title": "template_echo_message_response_model"
+      },
+      "template_image_test_form_model": {
+        "properties": {
+          "trigger": {
+            "type": "boolean",
+            "title": "Trigger",
+            "description": "Set true to fetch a new image. Exists because some clients require a non-empty input schema.",
+            "default": true
+          }
+        },
+        "type": "object",
+        "title": "template_image_test_form_model"
+      },
+      "template_image_test_response_model": {
+        "properties": {
+          "data": {
+            "type": "string",
+            "title": "Data",
+            "description": "Base64 encoded image data."
+          },
+          "mimeType": {
+            "type": "string",
+            "title": "Mimetype",
+            "description": "The MIME type of the image (e.g., 'image/jpeg')."
+          }
+        },
+        "type": "object",
+        "required": [
+          "data",
+          "mimeType"
+        ],
+        "title": "template_image_test_response_model"
+      },
+      "template_madlibs_elicitation_form_model": {
+        "properties": {
+          "noun": {
+            "type": "string",
+            "title": "Noun",
+            "description": "A noun for the story."
+          },
+          "verb": {
+            "type": "string",
+            "title": "Verb",
+            "description": "A verb (past tense) for the story."
+          },
+          "adjective": {
+            "type": "string",
+            "title": "Adjective",
+            "description": "An adjective for the story."
+          }
+        },
+        "type": "object",
+        "title": "template_madlibs_elicitation_form_model"
+      },
+      "template_madlibs_elicitation_response_model": {
+        "properties": {
+          "story": {
+            "type": "string",
+            "title": "Story",
+            "description": "The final, generated Mad Libs story."
+          },
+          "noun": {
+            "type": "string",
+            "title": "Noun",
+            "description": "The noun used in the story."
+          },
+          "verb": {
+            "type": "string",
+            "title": "Verb",
+            "description": "The verb used in the story."
+          },
+          "adjective": {
+            "type": "string",
+            "title": "Adjective",
+            "description": "The adjective used in the story."
+          }
+        },
+        "type": "object",
+        "required": [
+          "story",
+          "noun",
+          "verb",
+          "adjective"
+        ],
+        "title": "template_madlibs_elicitation_response_model"
+      }
+    }
+  }
+}

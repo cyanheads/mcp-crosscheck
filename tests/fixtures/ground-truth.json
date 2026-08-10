@@ -1,0 +1,146 @@
+{
+  "serverName": "example-mcp-server",
+  "serverVersion": "0.1.0",
+  "tools": [
+    {
+      "description": "Fetch a random cat fact from a public API. Optionally cap its character length.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "maxLength": {
+            "description": "Maximum character length of the returned fact.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          }
+        },
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "name": "template_cat_fact"
+    },
+    {
+      "description": "Echo a message back with optional formatting and repetition.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000,
+            "description": "The message to echo back."
+          },
+          "mode": {
+            "default": "standard",
+            "description": "How to format the message before repetition. `standard` returns it unchanged.",
+            "type": "string",
+            "enum": [
+              "standard",
+              "uppercase",
+              "lowercase"
+            ]
+          },
+          "repeat": {
+            "default": 1,
+            "description": "Number of times to repeat the formatted message.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 5
+          },
+          "includeTimestamp": {
+            "default": false,
+            "description": "Whether to include an ISO 8601 timestamp in the response.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "name": "template_echo_message"
+    },
+    {
+      "description": "Fetch a random cat image and return it base64-encoded with its MIME type.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "trigger": {
+            "default": true,
+            "description": "Set true to fetch a new image. Exists because some clients require a non-empty input schema.",
+            "type": "boolean"
+          }
+        },
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "name": "template_image_test"
+    },
+    {
+      "description": "Combine a noun, verb, and adjective into a one-line Mad Libs story. Any parts of speech omitted from the input are requested from the user during execution.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "noun": {
+            "description": "A noun for the story.",
+            "type": "string"
+          },
+          "verb": {
+            "description": "A verb (past tense) for the story.",
+            "type": "string"
+          },
+          "adjective": {
+            "description": "An adjective for the story.",
+            "type": "string"
+          }
+        },
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "name": "template_madlibs_elicitation"
+    },
+    {
+      "description": "Run a countdown timer for the requested number of seconds, reporting progress as it ticks. Cancellable mid-run. On task-capable clients the call returns immediately and progress streams over the task channel; otherwise it runs synchronously and returns when the countdown finishes.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 60,
+            "description": "Number of seconds to count down (1-60)"
+          },
+          "message": {
+            "description": "Optional message to include in the final result",
+            "type": "string"
+          },
+          "simulateFailure": {
+            "default": false,
+            "description": "Force a failure at 50% progress.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "seconds"
+        ],
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "Parameters for the async countdown task."
+      },
+      "name": "template_async_countdown"
+    },
+    {
+      "description": "Generate sample sales data and render an interactive table. Users can sort columns, filter rows, and select entries from the UI. Falls back to a plain text table where interactive UI is not available.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "rowCount": {
+            "default": 20,
+            "description": "Number of sample rows to generate (5-100).",
+            "type": "integer",
+            "minimum": 5,
+            "maximum": 100
+          }
+        },
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "name": "template_data_explorer"
+    }
+  ]
+}

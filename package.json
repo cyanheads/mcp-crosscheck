@@ -1,0 +1,82 @@
+{
+  "name": "mcp-crosscheck",
+  "version": "0.0.1",
+  "description": "Client-compatibility harness for MCP servers — run real MCP clients (MCP Inspector, mcpo, Codex CLI) against your built server and verify the tool surface they actually render. Deterministic: no LLM calls, no API keys.",
+  "type": "module",
+  "bin": {
+    "mcp-crosscheck": "dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": ["dist/", "CHANGELOG.md"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cyanheads/mcp-crosscheck.git"
+  },
+  "bugs": {
+    "url": "https://github.com/cyanheads/mcp-crosscheck/issues"
+  },
+  "homepage": "https://github.com/cyanheads/mcp-crosscheck#readme",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && chmod +x dist/cli.js",
+    "clean": "rm -rf dist .tsbuildinfo",
+    "rebuild": "bun run clean && bun run build",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check",
+    "format": "biome check --write .",
+    "test": "bun test",
+    "devcheck": "bun run scripts/devcheck.ts",
+    "prepublishOnly": "bun run rebuild"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.6",
+    "@socketsecurity/bun-security-scanner": "^1.1.2",
+    "@types/bun": "^1.3.14",
+    "@types/node": "26.1.2",
+    "typescript": "^7.0.2"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "mcp-server",
+    "testing",
+    "compatibility",
+    "harness",
+    "json-schema",
+    "openapi",
+    "mcpo",
+    "mcp-inspector",
+    "codex",
+    "cli",
+    "developer-tools"
+  ],
+  "author": "Casey Hand <casey@caseyjhand.com> (https://caseyjhand.com)",
+  "license": "Apache-2.0",
+  "funding": [
+    {
+      "type": "github",
+      "url": "https://github.com/sponsors/cyanheads"
+    },
+    {
+      "type": "buy_me_a_coffee",
+      "url": "https://www.buymeacoffee.com/cyanheads"
+    }
+  ],
+  "packageManager": "bun@1.3.14",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
