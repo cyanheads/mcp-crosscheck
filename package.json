@@ -1,6 +1,6 @@
 {
   "name": "mcp-crosscheck",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Client-compatibility harness for MCP servers — run real MCP clients (MCP Inspector, mcpo, Codex CLI) against your built server and verify the tool surface they actually render. Deterministic: no LLM calls, no API keys.",
   "type": "module",
   "bin": {
