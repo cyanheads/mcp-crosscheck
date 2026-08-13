@@ -48,6 +48,20 @@ function context(exec: Exec, overrides: Partial<AdapterContext> = {}): AdapterCo
 
 const EXEC_DEFAULT: ExecResult = { code: 0, signal: null, stderr: '', stdout: '', timedOut: false };
 const NEVER_EXITS = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(() => {});
+const INSTALL_PREAMBLE = Array.from(
+  { length: 30 },
+  (_, index) => `resolving package dependency ${index}`,
+).join('\n');
+const NPM_INSTALL_FAILURE = `${INSTALL_PREAMBLE}\nnpm ERR! code E404\nnpm ERR! package not found`;
+const RICH_IMPORT_FAILURE = [
+  INSTALL_PREAMBLE,
+  '╭──────────────────── Traceback (most recent call last) ────────────────────╮',
+  '│ /tmp/mcpo/bin/mcpo:5 in <module>                                         │',
+  '│                                                                          │',
+  '│   from mcpo.main import app                                              │',
+  '╰──────────────────────────────────────────────────────────────────────────╯',
+  'ImportError: cannot import name streamablehttp_client',
+].join('\n');
 
 /** A managed-process stub. `exited` settles only when the scenario says the child died. */
 function managed(opts: { exited?: boolean; onKill?: () => void; stderr?: string }): ManagedProcess {
@@ -100,10 +114,12 @@ function spawnExec(spawn: Exec['spawn']): Exec {
 describe('inspector', () => {
   test('adapter-broken: npx could not install the client', async () => {
     const result = await inspectorAdapter.run(
-      context(captureExec({ code: 1, stderr: 'npm ERR! code E404\nnpm ERR! 404 Not Found' })),
+      context(captureExec({ code: 1, stderr: NPM_INSTALL_FAILURE })),
     );
     expect(result.status).toBe('adapter-broken');
-    expect(result.statusDetail).toContain('E404');
+    expect(result.statusDetail).toStartWith('…');
+    expect(result.statusDetail).toContain('npm ERR! code E404');
+    expect(result.statusDetail).not.toContain('resolving package dependency 0');
     expect(result.surface).toBeNull();
   });
 
@@ -288,13 +304,13 @@ function openApiSpawn(document: string): Exec['spawn'] {
 
 describe('mcpo', () => {
   test('adapter-broken: the proxy died before serving openapi.json', async () => {
-    const traceback =
-      'Traceback (most recent call last):\n  File "mcpo/main.py", line 9\nImportError: cannot import name streamablehttp_client';
     const result = await mcpoAdapter.run(
-      context(spawnExec(() => managed({ exited: true, stderr: traceback }))),
+      context(spawnExec(() => managed({ exited: true, stderr: RICH_IMPORT_FAILURE }))),
     );
     expect(result.status).toBe('adapter-broken');
+    expect(result.statusDetail).toContain('from mcpo.main import app');
     expect(result.statusDetail).toContain('ImportError');
+    expect(result.statusDetail).not.toContain('resolving package dependency 0');
     expect(result.statusDetail).not.toContain('\n');
     expect(result.resolvedVersion).toBe('0.0.20');
   });
@@ -362,10 +378,11 @@ describe('codex', () => {
 
   test('adapter-broken: codex exited before issuing a model request', async () => {
     const result = await codexAdapter.run(
-      context(spawnExec(() => managed({ exited: true, stderr: 'npm error 404 Not Found' }))),
+      context(spawnExec(() => managed({ exited: true, stderr: NPM_INSTALL_FAILURE }))),
     );
     expect(result.status).toBe('adapter-broken');
-    expect(result.statusDetail).toContain('404 Not Found');
+    expect(result.statusDetail).toContain('npm ERR! code E404');
+    expect(result.statusDetail).not.toContain('resolving package dependency 0');
   });
 
   test('handshake-failure: the captured request carried no MCP tools', async () => {

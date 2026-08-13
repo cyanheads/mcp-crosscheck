@@ -159,8 +159,34 @@ export interface Exec {
 /** Real child processes — the default for every adapter run. */
 export const nodeExec: Exec = { capture: execCapture, spawn: spawnManaged };
 
+const BOX_DRAWING_ONLY = /^[\s\u2500-\u257f]+$/u;
+const ERROR_SHAPED =
+  /\b(?:error|exception|traceback|importerror|modulenotfounderror|cannot|failed)\b|\berr!/i;
+const WARNING_SHAPED = /\bwarn(?:ing)?\b/i;
+
 /** Compress process output into a short single-line excerpt for findings and status detail. */
 export function excerpt(text: string, maxLength = 400): string {
-  const flat = text.trim().replace(/\s+/g, ' ');
-  return flat.length > maxLength ? `${flat.slice(0, maxLength)}…` : flat;
+  if (!Number.isSafeInteger(maxLength) || maxLength < 0) {
+    throw new RangeError('maxLength must be a non-negative safe integer');
+  }
+
+  const lines = text
+    .split(/\r\n?|\n/u)
+    .map((line) => line.trim().replace(/\s+/g, ' '))
+    .filter((line) => line !== '' && !BOX_DRAWING_ONLY.test(line));
+  let offset = 0;
+  let lastErrorEnd = -1;
+  for (const [index, line] of lines.entries()) {
+    if (index > 0) offset += 1;
+    offset += line.length;
+    if (!WARNING_SHAPED.test(line) && ERROR_SHAPED.test(line)) lastErrorEnd = offset;
+  }
+  const flat = lines.join(' ');
+  if (flat.length <= maxLength) return flat;
+  if (lastErrorEnd === -1) return `${flat.slice(0, maxLength)}…`;
+  if (maxLength === 0) return '…';
+  const omittedAfter = lastErrorEnd < flat.length;
+  const contentLength = omittedAfter ? maxLength - 1 : maxLength;
+  const start = Math.max(0, lastErrorEnd - contentLength);
+  return `${start > 0 ? '…' : ''}${flat.slice(start, lastErrorEnd)}${omittedAfter ? '…' : ''}`;
 }
