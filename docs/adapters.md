@@ -14,8 +14,11 @@ Measurements are historical evidence, not claims about newer upstream releases.
 | Targets | stdio and streamable HTTP |
 | Capture | Runs `tools/list` through the Inspector CLI and normalizes the returned MCP schemas |
 | Canary | Optional `tools/call` with exact user-supplied arguments |
+| HTTP headers | Repeats Inspector's `--header 'Name: value'` for each configured target header |
 | Version | A pin is passed to `npx`; unpinned runs resolve the package version from npm because Inspector has no safe `--version` invocation |
 | Output | Preserves an advertised `outputSchema` from `tools/list` |
+
+Inspector receives HTTP header values in its process arguments. They may be visible to local process inspection even though crosscheck removes exact values from its own diagnostics and reports.
 
 ### Dated measurements
 
@@ -33,8 +36,11 @@ Measurements are historical evidence, not claims about newer upstream releases.
 | Targets | stdio and streamable HTTP |
 | Capture | Starts the OpenAPI proxy and parses `openapi.json` after readiness |
 | Canary | Optional POST with exact user-supplied arguments |
+| HTTP headers | Passes one JSON header map through mcpo's `--header` before its target separator |
 | Version | A pin is passed to `uvx`; unpinned runs resolve the exercised release from the client or PyPI |
 | Output | Parses a generated response model when the OpenAPI document contains one |
+
+The mcpo child argument contains the configured values. Its raw `openapi.json` artifact is server-controlled and remains local-sensitive.
 
 ### Dated measurements
 
@@ -49,17 +55,21 @@ Measurements are historical evidence, not claims about newer upstream releases.
 | Setting | Behavior |
 |:--|:--|
 | Selection | Opt-in |
-| Targets | stdio only |
-| Capture | Runs `codex exec` under a throwaway `CODEX_HOME`; a loopback provider with `wire_api = "responses"` captures the first tools-bearing request |
+| Targets | stdio and streamable HTTP |
+| Capture | Runs `codex exec` with a clean environment and throwaway `HOME`/`CODEX_HOME`; a loopback provider with `wire_api = "responses"` captures the first tools-bearing request |
 | Canary | None; capture-only |
 | Version | A pin selects the `@openai/codex` package passed to `npx`; unpinned runs resolve the exercised package version |
+| HTTP target | URL-only targets use `url`. Configured headers use generated `MCP_CROSSCHECK_TARGET_HEADER_<n>` names in `env_http_headers`; values exist only in the isolated child environment |
 | Output | Captures input `parameters` only and exposes no rendered output surface |
+
+The managed Codex child receives only its isolated homes, generated header variables, `PATH`, and `NO_PROXY`. It does not inherit ambient auth, provider-selection, proxy, or user-config variables. Stdio target environment variables remain inside the target's TOML table. Crosscheck does not place header values in TOML, Codex argv, reports, or the captured model request; raw captures remain local-sensitive.
 
 ### Dated measurements
 
 | Date | Client | Evidence | Reproduction constraint | Measured surface |
 |:--|:--|:--|:--|:--|
 | 2026-08-09 | Codex CLI 0.147.0 | `tests/fixtures/codex-request.json`, `tests/fixtures/ground-truth.json`, and `src/adapters/adapters.test.ts` | Throwaway `CODEX_HOME` and loopback Responses provider | The `mcp__target` namespace preserved the tested names, descriptions, types, required fields, and `enum`. The comparison recorded dropped numeric bounds. The capture has no rendered output-schema surface. |
+| 2026-08-13 | Codex CLI 0.147.0-alpha.6.5 | Protected HTTP lane in `tests/e2e.test.ts`, the frozen request parser fixture, and adapter config tests | Clean child environment, throwaway `HOME`/`CODEX_HOME`, environment-backed target header, and loopback Responses provider | The protected streamable HTTP fixture produced six MCP declarations. Comparison recorded six info-only constraint drops, matching the stdio fixture shape. The capture has no rendered output-schema surface. |
 
 ## Claude Code
 
@@ -89,3 +99,5 @@ Gemini CLI 0.42.0 reached a loopback model endpoint but emitted no declaration f
 ## Updating measurements
 
 Every fixture re-capture or new frozen adapter fixture adds a dated row naming the client version, fixture, parser test, and reproduction constraint. Committed request fixtures keep only the parser-relevant payload. Complete raw requests belong only in an explicitly selected local artifacts directory because they may contain volatile or sensitive client metadata.
+
+Target headers do not change that boundary. Crosscheck removes exact configured values from its statuses, findings, human/JSON reports, and persisted `report.json`. Raw ground-truth and adapter captures can contain arbitrary server echoes or transformed values, so the entire artifacts directory remains local-sensitive.

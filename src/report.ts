@@ -5,6 +5,7 @@
  */
 import { styleText } from 'node:util';
 
+import { redactReport } from './redact.js';
 import type { AdapterReport, Finding, RunReport } from './types.js';
 
 function paint(format: Parameters<typeof styleText>[0], text: string): string {
@@ -19,7 +20,7 @@ function adapterHeadline(adapter: AdapterReport): string {
   const version =
     adapter.resolvedVersion === null ? 'version unresolved' : `v${adapter.resolvedVersion}`;
   const seconds = (adapter.durationMs / 1000).toFixed(1);
-  const failCount = adapter.findings.filter((finding) => finding.severity === 'fail').length;
+  const failCount = adapter.newFindings.filter((finding) => finding.severity === 'fail').length;
   const verdict =
     failCount === 0
       ? paint(['green', 'bold'], 'PASS')
@@ -44,7 +45,8 @@ function renderCanaryLine(adapter: AdapterReport): string | null {
 }
 
 /** Render the full human-readable report. */
-export function renderHumanReport(report: RunReport): string {
+export function renderHumanReport(input: RunReport): string {
+  const report = redactReport(input);
   const lines: string[] = [];
   const targetLabel =
     report.target.kind === 'http'
@@ -72,14 +74,29 @@ export function renderHumanReport(report: RunReport): string {
     }
     const canaryLine = renderCanaryLine(adapter);
     if (canaryLine !== null) lines.push(canaryLine);
-    const ordered = [...adapter.findings].sort((a, b) =>
+    const ordered = [...adapter.newFindings].sort((a, b) =>
       a.severity === b.severity ? 0 : a.severity === 'fail' ? -1 : 1,
     );
     for (const finding of ordered) {
       lines.push(renderFinding(finding));
     }
-    if (adapter.findings.length === 0) {
+    if (adapter.newFindings.length === 0 && adapter.acknowledgedFindings.length === 0) {
       lines.push(`  ${paint('dim', 'no divergence from ground truth')}`);
+    }
+    if (adapter.acknowledgedFindings.length > 0) {
+      lines.push(
+        `  ${paint('dim', `${adapter.acknowledgedFindings.length} acknowledged finding(s) (see JSON for details)`)}`,
+      );
+    }
+    lines.push('');
+  }
+
+  if (report.baselineDiagnostics.length > 0) {
+    lines.push(paint('bold', 'Baseline diagnostics'));
+    for (const diagnostic of report.baselineDiagnostics) {
+      lines.push(
+        `  ${paint('yellow', 'info')} ${diagnostic.adapter} stale ${diagnostic.entry.rule} ${paint('cyan', diagnostic.entry.path)}`,
+      );
     }
     lines.push('');
   }
@@ -87,11 +104,11 @@ export function renderHumanReport(report: RunReport): string {
   const summary = report.pass
     ? paint(
         ['green', 'bold'],
-        `PASS — ${report.adapters.length} adapter(s), ${report.infoCount} info note(s)`,
+        `PASS — ${report.adapters.length} adapter(s), ${report.infoCount} new info note(s), ${report.acknowledgedCount} acknowledged, ${report.staleCount} stale`,
       )
     : paint(
         ['red', 'bold'],
-        `FAIL — ${report.failCount} failure(s), ${report.infoCount} info note(s) across ${report.adapters.length} adapter(s)`,
+        `FAIL — ${report.failCount} new failure(s), ${report.infoCount} new info note(s), ${report.acknowledgedCount} acknowledged, ${report.staleCount} stale across ${report.adapters.length} adapter(s)`,
       );
   lines.push(summary);
   return lines.join('\n');
@@ -99,5 +116,5 @@ export function renderHumanReport(report: RunReport): string {
 
 /** The stable machine-readable shape emitted by `--json`. */
 export function toJsonReport(report: RunReport): string {
-  return JSON.stringify(report, null, 2);
+  return JSON.stringify(redactReport(report), null, 2);
 }

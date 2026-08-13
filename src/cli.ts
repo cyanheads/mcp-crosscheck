@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import { parseArgs } from 'node:util';
 
 import { DEFAULT_ADAPTERS, isAdapterName } from './adapters/index.js';
+import { parseHttpHeaders } from './cli-args.js';
 import { renderHumanReport, toJsonReport } from './report.js';
 import { CrosscheckUsageError, runCrosscheck } from './run.js';
 import type { AdapterName, CanarySpec, TargetSpec } from './types.js';
@@ -16,7 +17,7 @@ import { VERSION } from './version.js';
 
 const USAGE = `mcp-crosscheck v${VERSION}
 Run real MCP clients against your built server and verify the tool surface
-they actually render. Deterministic: no LLM calls, no API keys.
+they actually render. No model inference or non-loopback provider traffic.
 
 Usage:
   mcp-crosscheck [flags] -- <command> [args...]     stdio server under test
@@ -31,6 +32,8 @@ Flags:
                        args (e.g. --canary 'echo_message={"message":"probe"}').
                        Verified against ground truth first. Never synthesized.
   --env <K=V>          Environment variable for the spawned server (repeatable).
+  --header <Name: value>
+                       HTTP request header for the target (repeatable; HTTP only).
   --pin <name=version> Pin an adapter version (repeatable), e.g. --pin mcpo=0.0.20.
                        claude-code requires the installed version to match its pin.
   --mcpo-with <spec>   Extra uvx --with dependency constraint for mcpo (repeatable),
@@ -38,6 +41,8 @@ Flags:
   --artifacts <dir>    Save the report and raw captures (report.json, ground truth,
                        openapi.json, codex request, claude-code request).
   --timeout <seconds>  Per-stage timeout. Default: 120.
+  --baseline <file>    Acknowledge matching reviewed rendering drift (read-only).
+  --update-baseline    Replace selected successful adapter entries after the run.
   --json               Machine-readable report on stdout.
   -h, --help           This help.
   -V, --version        Print version.
@@ -96,14 +101,17 @@ async function main(): Promise<number> {
     options: {
       adapters: { type: 'string' },
       artifacts: { type: 'string' },
+      baseline: { type: 'string' },
       canary: { type: 'string' },
       env: { multiple: true, type: 'string' },
       help: { short: 'h', type: 'boolean' },
+      header: { multiple: true, type: 'string' },
       http: { type: 'string' },
       json: { type: 'boolean' },
       'mcpo-with': { multiple: true, type: 'string' },
       pin: { multiple: true, type: 'string' },
       timeout: { type: 'string' },
+      'update-baseline': { type: 'boolean' },
       version: { short: 'V', type: 'boolean' },
     },
   });
@@ -118,14 +126,27 @@ async function main(): Promise<number> {
   }
 
   const env = Object.fromEntries((values.env ?? []).map((entry) => parseKeyValue(entry, '--env')));
+  let headers: Record<string, string>;
+  try {
+    headers = parseHttpHeaders(values.header ?? []);
+  } catch (error) {
+    throw new CrosscheckUsageError(error instanceof Error ? error.message : String(error));
+  }
+
+  if (values['update-baseline'] === true && values.baseline === undefined) {
+    throw new CrosscheckUsageError('--update-baseline requires --baseline <file>');
+  }
 
   let target: TargetSpec;
   if (values.http !== undefined) {
     if (positionals.length > 0) {
       throw new CrosscheckUsageError('--http and a stdio command are mutually exclusive');
     }
-    target = { kind: 'http', url: values.http };
+    target = { headers, kind: 'http', url: values.http };
   } else {
+    if (values.header !== undefined) {
+      throw new CrosscheckUsageError('--header is supported only with --http');
+    }
     const [command, ...args] = positionals;
     if (command === undefined) {
       throw new CrosscheckUsageError(
@@ -152,12 +173,14 @@ async function main(): Promise<number> {
   const report = await runCrosscheck({
     adapters: values.adapters === undefined ? DEFAULT_ADAPTERS : parseAdapters(values.adapters),
     artifactsDir: values.artifacts ?? null,
+    baselinePath: values.baseline ?? null,
     canary: values.canary === undefined ? null : parseCanary(values.canary),
     log: (line) => console.error(`[crosscheck] ${line}`),
     mcpoWith: values['mcpo-with'] ?? [],
     pins,
     target,
     timeoutMs: Math.round(timeoutSeconds * 1000),
+    updateBaseline: values['update-baseline'] === true,
   });
 
   if (values.artifacts !== undefined) {

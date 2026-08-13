@@ -52,6 +52,7 @@ function compareProperties(
           gtProperty.declaredIn === 'branch'
             ? 'input property is missing from the rendered surface — it is declared inside an anyOf/oneOf branch, which a converter reading only `properties` never sees'
             : 'input property is missing from the rendered surface',
+        evidence: { declaredIn: gtProperty.declaredIn, kind: 'property-missing' },
         path: propertyPath,
         rule: 'property-missing',
         severity: 'fail',
@@ -81,6 +82,12 @@ function compareNestedLevel(
         detail: `ground truth declares ${gtChildren.length} nested ${propertyNoun(
           gtChildren.length,
         )} here but the client rendered the object with none — every nested field would be dropped`,
+        evidence: {
+          branchOnly: gtChildren.every((property) => property.declaredIn === 'branch'),
+          expectedPropertyCount: gtChildren.length,
+          kind: 'input-empty',
+          scope: 'nested',
+        },
         path,
         rule: 'empty-request-body',
         severity: 'fail',
@@ -96,6 +103,7 @@ function compareNestedLevel(
   if (droppedRequired.length > 0) {
     findings.push({
       detail: `required marker dropped for: ${droppedRequired.join(', ')}`,
+      evidence: { kind: 'required-dropped', names: [...droppedRequired].sort() },
       path,
       rule: 'required-dropped',
       severity: 'fail',
@@ -115,6 +123,7 @@ function compareProperty(
   if (rendered.type === null) {
     findings.push({
       detail: `property rendered with no type information (ground truth: ${gt.type ?? 'untyped'})`,
+      evidence: { groundTruthType: gt.type, kind: 'property-untyped' },
       path,
       rule: 'property-untyped',
       severity: 'fail',
@@ -127,6 +136,7 @@ function compareProperty(
   ) {
     findings.push({
       detail: `property explicit type changed from ${gt.explicitType} to ${rendered.explicitType}`,
+      evidence: { from: gt.explicitType, kind: 'property-retyped', to: rendered.explicitType },
       path,
       rule: 'property-retyped',
       severity: 'fail',
@@ -135,6 +145,7 @@ function compareProperty(
   if (gt.description !== null && gt.description !== '' && rendered.description === null) {
     findings.push({
       detail: 'property description was lost in rendering',
+      evidence: { kind: 'description-lost', subject: 'property' },
       path,
       rule: 'description-lost',
       severity: 'fail',
@@ -144,8 +155,10 @@ function compareProperty(
     (keyword) => rendered.constraints[keyword] === undefined,
   );
   if (droppedConstraints.length > 0) {
+    droppedConstraints.sort();
     findings.push({
       detail: `constraint keyword${droppedConstraints.length === 1 ? '' : 's'} dropped: ${droppedConstraints.join(', ')}`,
+      evidence: { keywords: droppedConstraints, kind: 'constraint-dropped' },
       path,
       rule: 'constraint-dropped',
       severity: 'info',
@@ -171,6 +184,12 @@ function compareTool(gt: RenderedTool, rendered: RenderedTool): Finding[] {
       )}${
         branchOnly ? ', declared inside anyOf/oneOf branches,' : ''
       } but the client rendered an empty request body — every argument would be dropped`,
+      evidence: {
+        branchOnly,
+        expectedPropertyCount: gt.properties.length,
+        kind: 'input-empty',
+        scope: 'root',
+      },
       path: gt.name,
       rule: 'empty-request-body',
       severity: 'fail',
@@ -181,6 +200,7 @@ function compareTool(gt: RenderedTool, rendered: RenderedTool): Finding[] {
   if (gt.description !== null && gt.description !== '' && rendered.description === null) {
     findings.push({
       detail: 'tool description was lost in rendering',
+      evidence: { kind: 'description-lost', subject: 'tool' },
       path: gt.name,
       rule: 'description-lost',
       severity: 'fail',
@@ -193,6 +213,7 @@ function compareTool(gt: RenderedTool, rendered: RenderedTool): Finding[] {
   if (droppedRequired.length > 0) {
     findings.push({
       detail: `required marker dropped for: ${droppedRequired.join(', ')}`,
+      evidence: { kind: 'required-dropped', names: [...droppedRequired].sort() },
       path: gt.name,
       rule: 'required-dropped',
       severity: 'fail',
@@ -203,6 +224,7 @@ function compareTool(gt: RenderedTool, rendered: RenderedTool): Finding[] {
     findings.push({
       detail:
         'root anyOf/oneOf union is not represented in the rendered surface — the client cannot enforce which branch applies (fields declared inside the branches are compared as properties)',
+      evidence: { kind: 'anyof-ignored' },
       path: gt.name,
       rule: 'anyof-ignored',
       severity: 'info',
@@ -222,6 +244,7 @@ function compareOutputProperty(
   if (rendered.type === null) {
     findings.push({
       detail: `output field rendered with no type information (ground truth: ${gt.type ?? 'untyped'})`,
+      evidence: { groundTruthType: gt.type, kind: 'output-field-untyped' },
       path,
       rule: 'output-schema-divergence',
       severity: 'info',
@@ -234,6 +257,11 @@ function compareOutputProperty(
   ) {
     findings.push({
       detail: `output field explicit type changed from ${gt.explicitType} to ${rendered.explicitType}`,
+      evidence: {
+        from: gt.explicitType,
+        kind: 'output-field-retyped',
+        to: rendered.explicitType,
+      },
       path,
       rule: 'output-schema-divergence',
       severity: 'info',
@@ -247,6 +275,7 @@ function compareOutputProperty(
       detail: `ground truth declares ${gtChildren.length} nested output field${
         gtChildren.length === 1 ? '' : 's'
       } here but the client rendered the object with none — every nested output field is absent`,
+      evidence: { expectedPropertyCount: gtChildren.length, kind: 'output-nested-empty' },
       path,
       rule: 'output-schema-divergence',
       severity: 'info',
@@ -273,6 +302,7 @@ function compareOutputProperties(
     if (rendered === undefined) {
       findings.push({
         detail: 'output field is missing from the rendered result model',
+        evidence: { kind: 'output-field-missing' },
         path: propertyPath,
         rule: 'output-schema-divergence',
         severity: 'info',
@@ -302,6 +332,7 @@ function compareOutput(gt: GroundTruthTool, rendered: RenderedTool): Finding[] {
         detail: `ground truth advertises ${gtProperties.length} output ${propertyNoun(
           gtProperties.length,
         )} but the client rendered the result model with none`,
+        evidence: { expectedPropertyCount: gtProperties.length, kind: 'output-root-empty' },
         path,
         rule: 'output-schema-divergence',
         severity: 'info',
@@ -323,6 +354,7 @@ export function compareSurface(
     if (renderedTool === undefined) {
       findings.push({
         detail: 'tool is missing from the rendered surface',
+        evidence: { kind: 'tool-missing' },
         path: tool.name,
         rule: 'tool-missing',
         severity: 'fail',
@@ -346,6 +378,7 @@ export function buildFindings(
         detail: `adapter failed to launch (resolved version: ${result.resolvedVersion ?? 'unknown'})${
           result.statusDetail === null ? '' : ` — ${result.statusDetail}`
         }`,
+        evidence: { kind: 'adapter-broken' },
         path: null,
         rule: 'adapter-broken',
         severity: 'fail',
@@ -358,6 +391,7 @@ export function buildFindings(
         detail: `client could not complete the MCP handshake${
           result.statusDetail === null ? '' : ` — ${result.statusDetail}`
         }`,
+        evidence: { kind: 'handshake-failure' },
         path: null,
         rule: 'handshake-failure',
         severity: 'fail',
@@ -369,6 +403,7 @@ export function buildFindings(
   if (result.canary?.attempted === true && result.canary.ok === false) {
     findings.push({
       detail: `canary round-trip failed${result.canary.detail === null ? '' : ` — ${result.canary.detail}`}`,
+      evidence: { kind: 'canary-failed' },
       path: null,
       rule: 'canary-failed',
       severity: 'fail',

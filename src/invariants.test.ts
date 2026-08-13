@@ -130,6 +130,7 @@ describe('compareSurface', () => {
     expect(compareSurface([integerTool], { tools: [rendered] })).toEqual([
       {
         detail: 'property explicit type changed from integer to string',
+        evidence: { from: 'integer', kind: 'property-retyped', to: 'string' },
         path: 'set_count.count',
         rule: 'property-retyped',
         severity: 'fail',
@@ -208,6 +209,7 @@ describe('compareSurface', () => {
     expect(compareSurface([gt], { tools: [rendered] })).toEqual([
       {
         detail: 'required marker dropped for: retries, timeoutMs',
+        evidence: { kind: 'required-dropped', names: ['retries', 'timeoutMs'] },
         path: 'configure',
         rule: 'required-dropped',
         severity: 'fail',
@@ -269,6 +271,7 @@ describe('compareSurface', () => {
     expect(compareSurface([nullableTool], { tools: [rendered] })).toEqual([
       {
         detail: 'property explicit type changed from null|string to string',
+        evidence: { from: 'null|string', kind: 'property-retyped', to: 'string' },
         path: 'set_label.label',
         rule: 'property-retyped',
         severity: 'fail',
@@ -473,6 +476,7 @@ describe('nested comparison', () => {
     expect(findings).toEqual([
       {
         detail: 'property explicit type changed from integer to string',
+        evidence: { from: 'integer', kind: 'property-retyped', to: 'string' },
         path: 'connect.config.transport.timeoutMs',
         rule: 'property-retyped',
         severity: 'fail',
@@ -535,6 +539,7 @@ describe('nested comparison', () => {
     expect(compareSurface([gt], { tools: [rendered] })).toEqual([
       {
         detail: 'required marker dropped for: retries, timeoutMs',
+        evidence: { kind: 'required-dropped', names: ['retries', 'timeoutMs'] },
         path: 'configure.config',
         rule: 'required-dropped',
         severity: 'fail',
@@ -567,6 +572,7 @@ describe('nested comparison', () => {
     expect(compareSurface([gt], { tools: [rendered] })).toEqual([
       {
         detail: 'required marker dropped for: timeoutMs',
+        evidence: { kind: 'required-dropped', names: ['timeoutMs'] },
         path: 'configure.transport',
         rule: 'required-dropped',
         severity: 'fail',
@@ -598,6 +604,7 @@ describe('nested comparison', () => {
     expect(compareSurface([gt], { tools: [rendered] })).toEqual([
       {
         detail: 'required marker dropped for: timeoutMs',
+        evidence: { kind: 'required-dropped', names: ['timeoutMs'] },
         path: 'configure_many.transports[]',
         rule: 'required-dropped',
         severity: 'fail',
@@ -654,6 +661,7 @@ describe('nested comparison', () => {
     expect(compareSurface([gt], oldShapeSurface)).toEqual([
       {
         detail: 'required marker dropped for: retries',
+        evidence: { kind: 'required-dropped', names: ['retries'] },
         path: 'configure.config',
         rule: 'required-dropped',
         severity: 'fail',
@@ -712,6 +720,7 @@ describe('nested comparison', () => {
     expect(compareSurface([listTool], { tools: [rendered] })).toEqual([
       {
         detail: 'property explicit type changed from integer to string',
+        evidence: { from: 'integer', kind: 'property-retyped', to: 'string' },
         path: 'store.values[]',
         rule: 'property-retyped',
         severity: 'fail',
@@ -753,6 +762,7 @@ describe('nested comparison', () => {
     expect(compareSurface([listTool], { tools: [rendered] })).toEqual([
       {
         detail: 'required marker dropped for: value, unit',
+        evidence: { kind: 'required-dropped', names: ['unit', 'value'] },
         path: 'store.values[]',
         rule: 'required-dropped',
         severity: 'fail',
@@ -805,6 +815,12 @@ describe('nested comparison', () => {
       {
         detail:
           'ground truth declares 1 nested property here but the client rendered the object with none — every nested field would be dropped',
+        evidence: {
+          branchOnly: false,
+          expectedPropertyCount: 1,
+          kind: 'input-empty',
+          scope: 'nested',
+        },
         path: 'configure.config',
         rule: 'empty-request-body',
         severity: 'fail',
@@ -1095,6 +1111,7 @@ describe('output schema rendering', () => {
       {
         detail:
           'ground truth declares 2 nested output fields here but the client rendered the object with none — every nested output field is absent',
+        evidence: { expectedPropertyCount: 2, kind: 'output-nested-empty' },
         path: 'output:connect.summary',
         rule: 'output-schema-divergence',
         severity: 'info',
@@ -1119,6 +1136,7 @@ describe('output schema rendering', () => {
       {
         detail:
           'ground truth declares 1 nested output field here but the client rendered the object with none — every nested output field is absent',
+        evidence: { expectedPropertyCount: 1, kind: 'output-nested-empty' },
         path: 'output:connect.attempts[]',
         rule: 'output-schema-divergence',
         severity: 'info',
@@ -1158,6 +1176,7 @@ describe('output schema rendering', () => {
     expect(compareSurface([gt], { tools: [rendered] })).toEqual([
       {
         detail: 'output field is missing from the rendered result model',
+        evidence: { kind: 'output-field-missing' },
         path: 'output:connect.summary.totalAttempts',
         rule: 'output-schema-divergence',
         severity: 'info',
@@ -1177,6 +1196,7 @@ describe('output schema rendering', () => {
     expect(findings).toEqual([
       {
         detail: 'output field explicit type changed from array to string',
+        evidence: { from: 'array', kind: 'output-field-retyped', to: 'string' },
         path: 'output:connect.attempts',
         rule: 'output-schema-divergence',
         severity: 'info',
@@ -1184,6 +1204,7 @@ describe('output schema rendering', () => {
       {
         detail:
           'ground truth declares 1 nested output field here but the client rendered the object with none — every nested output field is absent',
+        evidence: { expectedPropertyCount: 1, kind: 'output-nested-empty' },
         path: 'output:connect.summary',
         rule: 'output-schema-divergence',
         severity: 'info',
@@ -1209,6 +1230,7 @@ describe('output schema rendering', () => {
     expect(findings).toEqual([
       {
         detail: 'output field explicit type changed from boolean to string',
+        evidence: { from: 'boolean', kind: 'output-field-retyped', to: 'string' },
         path: 'output:connect.summary.connected',
         rule: 'output-schema-divergence',
         severity: 'info',
@@ -1297,5 +1319,84 @@ describe('buildFindings', () => {
       surface: faithful,
     };
     expect(buildFindings([gtTool], result)).toEqual([]);
+  });
+});
+
+describe('structured finding evidence', () => {
+  test('rendering findings carry stable facts without parsing detail text', () => {
+    const missingTool = compareSurface([gtTool], { tools: [] })[0];
+    expect(missingTool?.evidence).toEqual({ kind: 'tool-missing' });
+
+    const empty = compareSurface([gtTool], renderedFrom({ type: 'object' }))[0];
+    expect(empty?.evidence).toEqual({
+      branchOnly: false,
+      expectedPropertyCount: 2,
+      kind: 'input-empty',
+      scope: 'root',
+    });
+
+    const degraded = compareSurface(
+      [gtTool],
+      renderedFrom({
+        properties: {
+          message: { description: 'The message to echo.' },
+        },
+        type: 'object',
+      }),
+    );
+    expect(degraded.map((finding) => finding.evidence)).toEqual([
+      { groundTruthType: 'string', kind: 'property-untyped' },
+      { keywords: ['maxLength', 'minLength'], kind: 'constraint-dropped' },
+      { declaredIn: 'root', kind: 'property-missing' },
+      { kind: 'required-dropped', names: ['message'] },
+    ]);
+  });
+
+  test('output divergence variants remain distinct at a shared rule', () => {
+    const groundTruth: GroundTruthTool = {
+      description: 'Return a result.',
+      inputSchema: { type: 'object' },
+      name: 'result',
+      outputSchema: {
+        properties: {
+          count: { type: 'integer' },
+          meta: { properties: { ok: { type: 'boolean' } }, type: 'object' },
+          name: { type: 'string' },
+        },
+        type: 'object',
+      },
+    };
+    const rendered = renderedToolFromJsonSchema('result', 'Return a result.', { type: 'object' });
+    rendered.outputProperties = renderedPropertiesFromJsonSchema({
+      properties: {
+        count: {},
+        meta: { type: 'object' },
+      },
+      type: 'object',
+    });
+    expect(
+      compareSurface([groundTruth], { tools: [rendered] }).map((finding) => finding.evidence),
+    ).toEqual([
+      { groundTruthType: 'integer', kind: 'output-field-untyped' },
+      { expectedPropertyCount: 1, kind: 'output-nested-empty' },
+      { kind: 'output-field-missing' },
+    ]);
+  });
+
+  test('runtime findings have evidence but remain separate from rendering facts', () => {
+    const base = {
+      adapter: 'mcpo',
+      canary: null,
+      durationMs: 1,
+      resolvedVersion: '0.0.20',
+      statusDetail: 'failed',
+      surface: null,
+    } as const;
+    expect(buildFindings([], { ...base, status: 'adapter-broken' })[0]?.evidence).toEqual({
+      kind: 'adapter-broken',
+    });
+    expect(buildFindings([], { ...base, status: 'handshake-failure' })[0]?.evidence).toEqual({
+      kind: 'handshake-failure',
+    });
   });
 });

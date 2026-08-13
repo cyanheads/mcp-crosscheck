@@ -17,13 +17,17 @@
  * Adapter package runners still launch from a neutral scratch cwd.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { captureGroundTruth, runGroundTruthCanary } from '../src/ground-truth.js';
+import {
+  captureGroundTruth,
+  runGroundTruthCanary,
+  terminateGroundTruthSession,
+} from '../src/ground-truth.js';
 import { compareSurface } from '../src/invariants.js';
-import { renderHumanReport } from '../src/report.js';
+import { renderHumanReport, toJsonReport } from '../src/report.js';
 import { CrosscheckUsageError, runCrosscheck } from '../src/run.js';
 import { renderedPropertiesFromJsonSchema, renderedToolFromJsonSchema } from '../src/schema.js';
 import type {
@@ -33,7 +37,7 @@ import type {
   RunReport,
   TargetSpec,
 } from '../src/types.js';
-import { type ExecResult, execCapture, spawnManaged } from '../src/util/exec.js';
+import { type Exec, type ExecResult, execCapture, spawnManaged } from '../src/util/exec.js';
 import { getFreePort, waitForReady } from '../src/util/net.js';
 import { VERSION } from '../src/version.js';
 import { FIXTURE_TOOLS } from './fixture-server/tools.js';
@@ -43,6 +47,7 @@ const CLI = join(REPO_ROOT, 'src', 'cli.ts');
 const FIXTURE_SERVER = join(import.meta.dir, 'fixture-server', 'server.ts');
 /** Pinned so version resolution short-circuits instead of calling `npm view`. */
 const INSPECTOR_PIN = '2.1.0';
+const CODEX_HTTP_PIN = '0.147.0-alpha.6.5';
 const TIMEOUT_MS = 30_000;
 
 /** `repeat` is an integer: every adapter has to carry a non-string argument through unchanged. */
@@ -100,6 +105,27 @@ function verbatimSurface(groundTruth: GroundTruth): RenderedSurface {
       }
       return rendered;
     }),
+  };
+}
+
+function inspectorFixtureExec(missingEchoProperties: string[] = []): Exec {
+  const tools = structuredClone(FIXTURE_TOOLS);
+  const echo = tools.find((tool) => tool.name === 'echo_message');
+  if (echo !== undefined && typeof echo.inputSchema.properties === 'object') {
+    for (const name of missingEchoProperties) delete echo.inputSchema.properties?.[name];
+  }
+  return {
+    capture: () =>
+      Promise.resolve({
+        code: 0,
+        signal: null,
+        stderr: '',
+        stdout: JSON.stringify({ tools }),
+        timedOut: false,
+      }),
+    spawn: () => {
+      throw new Error('inspector baseline fake does not spawn');
+    },
   };
 }
 
@@ -195,9 +221,140 @@ describe('hermetic core: streamable-http', () => {
       ok: true,
     });
   });
+
+  test('redacts server-controlled identity from every progress log line', async () => {
+    const secret = 'crosscheck-fixture-server';
+    const logs: string[] = [];
+    const httpTarget = target as Extract<TargetSpec, { kind: 'http' }>;
+    await runCrosscheck({
+      adapters: [],
+      log: (line) => logs.push(line),
+      target: { ...httpTarget, headers: { 'X-Dummy': secret } },
+      timeoutMs: TIMEOUT_MS,
+    });
+    expect(logs.join('\n')).not.toContain(secret);
+    expect(logs.join('\n')).toContain('[REDACTED]');
+  });
+});
+
+describe('hermetic core: protected streamable-http', () => {
+  test('carries the configured header through initialize, tools/list, tools/call, and DELETE', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'crosscheck-protected-http-'));
+    const recordPath = join(dir, 'requests.jsonl');
+    const port = await getFreePort();
+    const secret = 'fixture:secret';
+    const proc = spawnManaged(process.execPath, [FIXTURE_SERVER], {
+      env: {
+        MCP_HTTP_PORT: String(port),
+        MCP_HTTP_RECORD_PATH: recordPath,
+        MCP_REQUIRED_HEADER_NAME: 'X-Fixture-Auth',
+        MCP_REQUIRED_HEADER_VALUE: secret,
+        MCP_TRANSPORT_TYPE: 'http',
+      },
+    });
+    const target: Extract<TargetSpec, { kind: 'http' }> = {
+      headers: { 'X-Fixture-Auth': `  ${secret}  `.trim() },
+      kind: 'http',
+      url: `http://127.0.0.1:${port}/mcp`,
+    };
+    try {
+      const failure = await waitForReady({
+        failFast: () => (proc.hasExited() ? `fixture server exited — ${proc.stderrTail()}` : null),
+        intervalMs: 50,
+        probe: () => Promise.resolve(proc.stderrTail().includes('streamable-http on')),
+        timeoutMs: TIMEOUT_MS,
+      });
+      if (failure !== null) throw new Error(failure);
+      expect((await captureGroundTruth(target, TIMEOUT_MS)).tools).toHaveLength(6);
+      expect(await runGroundTruthCanary(target, CANARY, TIMEOUT_MS)).toEqual({
+        attempted: true,
+        detail: null,
+        ok: true,
+      });
+      await terminateGroundTruthSession(target, TIMEOUT_MS);
+
+      const records = (await readFile(recordPath, 'utf8'))
+        .trim()
+        .split('\n')
+        .map(
+          (line) =>
+            JSON.parse(line) as { header: string; method: string; rpcMethod: string | null },
+        );
+      expect(records.every((record) => record.header === secret)).toBe(true);
+      expect(records.map((record) => record.rpcMethod)).toContain('initialize');
+      expect(records.map((record) => record.rpcMethod)).toContain('tools/list');
+      expect(records.map((record) => record.rpcMethod)).toContain('tools/call');
+      expect(records.map((record) => record.method)).toContain('DELETE');
+
+      const report = await runCrosscheck({ adapters: [], target, timeoutMs: TIMEOUT_MS });
+      expect(report.target).toEqual({ kind: 'http', url: target.url });
+      expect(toJsonReport(report)).not.toContain(secret);
+    } finally {
+      proc.kill();
+      await rm(dir, { force: true, recursive: true });
+    }
+  });
+
+  test('redacts a controlled rejected response from fatal diagnostics', async () => {
+    const port = await getFreePort();
+    const secret = 'fixture-secret';
+    const proc = spawnManaged(process.execPath, [FIXTURE_SERVER], {
+      env: {
+        MCP_HTTP_PORT: String(port),
+        MCP_REJECT_HEADER: '1',
+        MCP_REQUIRED_HEADER_NAME: 'X-Fixture-Auth',
+        MCP_REQUIRED_HEADER_VALUE: secret,
+        MCP_TRANSPORT_TYPE: 'http',
+      },
+    });
+    try {
+      const failure = await waitForReady({
+        failFast: () => (proc.hasExited() ? `fixture server exited — ${proc.stderrTail()}` : null),
+        intervalMs: 50,
+        probe: () => Promise.resolve(proc.stderrTail().includes('streamable-http on')),
+        timeoutMs: TIMEOUT_MS,
+      });
+      if (failure !== null) throw new Error(failure);
+      await expect(
+        runCrosscheck({
+          adapters: [],
+          target: {
+            headers: { 'X-Fixture-Auth': secret },
+            kind: 'http',
+            url: `http://127.0.0.1:${port}/mcp`,
+          },
+          timeoutMs: TIMEOUT_MS,
+        }),
+      ).rejects.not.toThrow(secret);
+    } finally {
+      proc.kill();
+    }
+  });
 });
 
 describe('hermetic core: orchestration', () => {
+  test('rejects invalid programmatic HTTP header maps without echoing values', async () => {
+    const secret = 'programmatic-secret';
+    const scenarios = [
+      { 'Bad Name': secret },
+      { 'X-Empty': '' },
+      { 'X-Test': secret, 'x-test': 'duplicate' },
+    ];
+    for (const headers of scenarios) {
+      try {
+        await runCrosscheck({
+          adapters: ['claude-code'],
+          target: { headers, kind: 'http', url: 'http://127.0.0.1:1/mcp' },
+        });
+        throw new Error('expected programmatic header validation to fail');
+      } catch (error) {
+        expect(error).toBeInstanceOf(CrosscheckUsageError);
+        expect(String(error)).toContain('header');
+        expect(String(error)).not.toContain(secret);
+      }
+    }
+  });
+
   test('canonicalizes a relative programmatic target and persists ground truth', async () => {
     const artifactsDir = await mkdtemp(join(tmpdir(), 'crosscheck-e2e-'));
     try {
@@ -240,6 +397,152 @@ describe('hermetic core: orchestration', () => {
       timeoutMs: TIMEOUT_MS,
     });
     await expect(run).rejects.toThrow(CrosscheckUsageError);
+  });
+
+  test('baseline update then read acknowledges reviewed drift while changed evidence stays new', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'crosscheck-baseline-run-'));
+    const baselinePath = join(dir, 'baseline.json');
+    const options = {
+      adapters: ['inspector'] as const,
+      baselinePath,
+      exec: inspectorFixtureExec(['mode']),
+      pins: { inspector: INSPECTOR_PIN },
+      target: STDIO_TARGET,
+      timeoutMs: TIMEOUT_MS,
+    };
+    try {
+      const updated = await runCrosscheck({
+        ...options,
+        adapters: [...options.adapters],
+        updateBaseline: true,
+      });
+      expect(updated.pass).toBe(true);
+      expect(updated.adapters[0]?.findings).toHaveLength(1);
+      expect(updated.adapters[0]?.newFindings).toEqual([]);
+      expect(updated.adapters[0]?.acknowledgedFindings).toHaveLength(1);
+      const firstBytes = await readFile(baselinePath, 'utf8');
+
+      const read = await runCrosscheck({ ...options, adapters: [...options.adapters] });
+      expect(read.pass).toBe(true);
+      expect(read.failCount).toBe(0);
+      expect(read.acknowledgedCount).toBe(1);
+      expect(renderHumanReport(read)).toContain('1 acknowledged finding(s)');
+      const json = JSON.parse(toJsonReport(read)) as RunReport;
+      expect(json.adapters[0]?.findings).toHaveLength(1);
+      expect(json.adapters[0]?.newFindings).toEqual([]);
+      expect(json.adapters[0]?.acknowledgedFindings).toHaveLength(1);
+      expect(await readFile(baselinePath, 'utf8')).toBe(firstBytes);
+
+      const changed = await runCrosscheck({
+        ...options,
+        adapters: [...options.adapters],
+        exec: inspectorFixtureExec(['mode', 'repeat']),
+      });
+      expect(changed.pass).toBe(false);
+      expect(changed.adapters[0]?.acknowledgedFindings).toHaveLength(1);
+      expect(changed.adapters[0]?.newFindings).toHaveLength(1);
+
+      const stale = await runCrosscheck({
+        ...options,
+        adapters: [...options.adapters],
+        exec: inspectorFixtureExec(),
+      });
+      expect(stale.pass).toBe(true);
+      expect(stale.staleCount).toBe(1);
+      expect(stale.baselineDiagnostics[0]?.adapter).toBe('inspector');
+      expect(renderHumanReport(stale)).toContain('Baseline diagnostics');
+    } finally {
+      await rm(dir, { force: true, recursive: true });
+    }
+  });
+
+  test('a selected adapter without a surface leaves an existing baseline byte-identical', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'crosscheck-baseline-run-'));
+    const baselinePath = join(dir, 'baseline.json');
+    const original = '{\n  "baselineVersion": 1,\n  "entries": []\n}\n';
+    await writeFile(baselinePath, original);
+    const failedExec: Exec = {
+      capture: () =>
+        Promise.resolve({
+          code: 1,
+          signal: null,
+          stderr: 'MCP handshake failed',
+          stdout: '',
+          timedOut: false,
+        }),
+      spawn: () => {
+        throw new Error('inspector baseline fake does not spawn');
+      },
+    };
+    try {
+      const report = await runCrosscheck({
+        adapters: ['inspector'],
+        baselinePath,
+        exec: failedExec,
+        pins: { inspector: INSPECTOR_PIN },
+        target: STDIO_TARGET,
+        timeoutMs: TIMEOUT_MS,
+        updateBaseline: true,
+      });
+      expect(report.pass).toBe(false);
+      expect(report.adapters[0]?.newFindings[0]?.rule).toBe('handshake-failure');
+      expect(await readFile(baselinePath, 'utf8')).toBe(original);
+    } finally {
+      await rm(dir, { force: true, recursive: true });
+    }
+  });
+
+  test('ground-truth and adapter canary failures leave the baseline byte-identical', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'crosscheck-baseline-run-'));
+    const baselinePath = join(dir, 'baseline.json');
+    const original = '{\n  "baselineVersion": 1,\n  "entries": []\n}\n';
+    await writeFile(baselinePath, original);
+    try {
+      await expect(
+        runCrosscheck({
+          adapters: [],
+          baselinePath,
+          target: { headers: {}, kind: 'http', url: 'http://127.0.0.1:1/mcp' },
+          timeoutMs: 500,
+          updateBaseline: true,
+        }),
+      ).rejects.toThrow();
+      expect(await readFile(baselinePath, 'utf8')).toBe(original);
+
+      let call = 0;
+      const canaryFailureExec: Exec = {
+        capture: () => {
+          call += 1;
+          return Promise.resolve({
+            code: 0,
+            signal: null,
+            stderr: '',
+            stdout:
+              call === 1
+                ? JSON.stringify({ tools: structuredClone(FIXTURE_TOOLS) })
+                : JSON.stringify({ content: [{ text: 'rejected', type: 'text' }], isError: true }),
+            timedOut: false,
+          });
+        },
+        spawn: () => {
+          throw new Error('inspector baseline fake does not spawn');
+        },
+      };
+      const report = await runCrosscheck({
+        adapters: ['inspector'],
+        baselinePath,
+        canary: CANARY,
+        exec: canaryFailureExec,
+        pins: { inspector: INSPECTOR_PIN },
+        target: STDIO_TARGET,
+        timeoutMs: TIMEOUT_MS,
+        updateBaseline: true,
+      });
+      expect(report.adapters[0]?.newFindings[0]?.rule).toBe('canary-failed');
+      expect(await readFile(baselinePath, 'utf8')).toBe(original);
+    } finally {
+      await rm(dir, { force: true, recursive: true });
+    }
   });
 });
 
@@ -290,6 +593,75 @@ describe('CLI process lane', () => {
     const result = await runCli(['--adapters', 'claude-code', '--http', 'http://127.0.0.1:1/mcp']);
     expect(result.code).toBe(2);
     expect(result.stderr).toContain('claude-code adapter supports stdio targets only');
+  });
+
+  test('validates repeatable HTTP headers without echoing supplied values', async () => {
+    const secret = 'must-not-appear';
+    const scenarios = [
+      ['--header', `Bad Name: ${secret}`],
+      ['--header', `X-Test: ${secret}`, '--header', 'x-test: duplicate'],
+      ['--header', `NoColon${secret}`],
+      ['--header', `: ${secret}`],
+      ['--header', 'X-Empty:   '],
+    ];
+    for (const flags of scenarios) {
+      const result = await runCli([...flags, '--http', 'http://127.0.0.1:1/mcp']);
+      expect(result.code).toBe(2);
+      expect(result.stderr).toContain('--header');
+      expect(result.stderr).not.toContain(secret);
+    }
+    const stdio = await runCli([
+      '--header',
+      `Authorization: Bearer ${secret}`,
+      '--',
+      process.execPath,
+      FIXTURE_SERVER,
+    ]);
+    expect(stdio.code).toBe(2);
+    expect(stdio.stderr).not.toContain(secret);
+  });
+
+  test('validates coupled baseline flags before running the target', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'crosscheck-baseline-cli-'));
+    const missing = join(dir, 'missing.json');
+    try {
+      const readOnly = await runCli([
+        '--baseline',
+        missing,
+        '--',
+        process.execPath,
+        FIXTURE_SERVER,
+      ]);
+      expect(readOnly.code).toBe(2);
+      const uncoupled = await runCli(['--update-baseline', '--', process.execPath, FIXTURE_SERVER]);
+      expect(uncoupled.code).toBe(2);
+    } finally {
+      await rm(dir, { force: true, recursive: true });
+    }
+  });
+
+  test('rejects a normalized baseline path that aliases a generated report artifact', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'crosscheck-baseline-alias-'));
+    try {
+      const result = await runCli([
+        '--adapters',
+        'claude-code',
+        '--artifacts',
+        dir,
+        '--baseline',
+        join(dir, 'nested', '..', 'report.json'),
+        '--update-baseline',
+        '--http',
+        'http://127.0.0.1:1/mcp',
+      ]);
+      expect(result.code).toBe(2);
+      expect(result.stderr).toContain('baseline');
+      expect(result.stderr).toContain('report.json');
+      expect(result.stderr).toContain('artifact');
+      expect(result.stderr).not.toContain('supports stdio targets only');
+    } finally {
+      await rm(dir, { force: true, recursive: true });
+    }
   });
 });
 
@@ -423,6 +795,61 @@ describe.skipIf(!CODEX_LANE)('codex lane', () => {
       detail: 'codex adapter is capture-only',
       ok: null,
     });
+  }, 600_000);
+
+  test('captures a protected streamable-http target with environment-backed headers', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'crosscheck-codex-http-'));
+    const recordPath = join(dir, 'requests.jsonl');
+    const port = await getFreePort();
+    const secret = 'codex-http-dummy';
+    const proc = spawnManaged(process.execPath, [FIXTURE_SERVER], {
+      env: {
+        MCP_HTTP_PORT: String(port),
+        MCP_HTTP_RECORD_PATH: recordPath,
+        MCP_REQUIRED_HEADER_NAME: 'X-Fixture-Auth',
+        MCP_REQUIRED_HEADER_VALUE: secret,
+        MCP_TRANSPORT_TYPE: 'http',
+      },
+    });
+    try {
+      const failure = await waitForReady({
+        failFast: () => (proc.hasExited() ? `fixture server exited — ${proc.stderrTail()}` : null),
+        intervalMs: 50,
+        probe: () => Promise.resolve(proc.stderrTail().includes('streamable-http on')),
+        timeoutMs: TIMEOUT_MS,
+      });
+      if (failure !== null) throw new Error(failure);
+      const result = await runCli(
+        [
+          '--adapters',
+          'codex',
+          '--pin',
+          `codex=${CODEX_HTTP_PIN}`,
+          '--header',
+          `X-Fixture-Auth: ${secret}`,
+          '--artifacts',
+          dir,
+          '--json',
+          '--http',
+          `http://127.0.0.1:${port}/mcp`,
+        ],
+        540_000,
+      );
+      expect(result.code).toBe(0);
+      const report = JSON.parse(result.stdout) as RunReport;
+      const [codex] = report.adapters;
+      expect(codex?.resolvedVersion).toBe(CODEX_HTTP_PIN);
+      expect(codex?.status).toBe('ok');
+      expect(codex?.toolCount).toBe(6);
+      expect(codex?.findings).toHaveLength(6);
+      expect(codex?.findings.every((finding) => finding.rule === 'constraint-dropped')).toBe(true);
+      expect(result.stdout).not.toContain(secret);
+      expect(await readFile(join(dir, 'report.json'), 'utf8')).not.toContain(secret);
+      expect(await readFile(join(dir, 'codex.request.json'), 'utf8')).not.toContain(secret);
+    } finally {
+      proc.kill();
+      await rm(dir, { force: true, recursive: true });
+    }
   }, 600_000);
 });
 

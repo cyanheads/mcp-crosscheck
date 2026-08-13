@@ -24,12 +24,18 @@ import { VERSION } from './version.js';
 
 const MAX_TOOL_PAGES = 100;
 
+function buildHttpTransport(target: Extract<TargetSpec, { kind: 'http' }>) {
+  return new StreamableHTTPClientTransport(new URL(target.url), {
+    requestInit: target.headers === undefined ? {} : { headers: target.headers },
+  });
+}
+
 function buildTransport(target: TargetSpec): Transport {
   if (target.kind === 'http') {
     // Widening cast: the SDK is not compiled with exactOptionalPropertyTypes,
     // so its concrete transport's `sessionId: string | undefined` does not
     // satisfy the Transport interface under this project's stricter settings.
-    return new StreamableHTTPClientTransport(new URL(target.url)) as Transport;
+    return buildHttpTransport(target) as Transport;
   }
   return new StdioClientTransport({
     args: target.args,
@@ -37,6 +43,29 @@ function buildTransport(target: TargetSpec): Transport {
     env: { ...getDefaultEnvironment(), ...target.env },
     stderr: 'ignore',
   });
+}
+
+/** Connect and explicitly terminate one HTTP session, exercising the SDK DELETE path. */
+export async function terminateGroundTruthSession(
+  target: Extract<TargetSpec, { kind: 'http' }>,
+  timeoutMs: number,
+): Promise<void> {
+  const client = new Client({ name: 'mcp-crosscheck', version: VERSION });
+  const transport = buildHttpTransport(target);
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`ground-truth client timed out after ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+  });
+  try {
+    await Promise.race([client.connect(transport as Transport), timeout]);
+    await Promise.race([transport.terminateSession(), timeout]);
+  } finally {
+    clearTimeout(timer);
+    await client.close().catch(() => {});
+  }
 }
 
 async function withClient<T>(

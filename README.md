@@ -1,7 +1,7 @@
 <div align="center">
   <h1>mcp-crosscheck</h1>
   <p><b>Test the tool schema your MCP clients actually see.</b></p>
-  <p>Run real clients against your server and diff their rendered tool surface against <code>tools/list</code>. No LLM calls. No API keys.</p>
+  <p>Run real clients against your server and diff their rendered tool surface against <code>tools/list</code>. No LLM calls.</p>
 </div>
 
 <div align="center">
@@ -22,6 +22,9 @@ npx mcp-crosscheck -- node ./dist/index.js
 
 # running streamable-http server
 npx mcp-crosscheck --http https://example.com/mcp
+
+# authenticated streamable-http server
+npx mcp-crosscheck --http https://example.com/mcp --header 'Authorization: Bearer dummy'
 
 # verify one safe tool call with exact arguments
 npx mcp-crosscheck --canary 'echo_message={"message":"probe"}' -- node ./dist/index.js
@@ -51,10 +54,10 @@ The optional canary uses one tool and the exact arguments you provide. Crosschec
 |:--|:--:|:--|:--|
 | [MCP Inspector](https://github.com/modelcontextprotocol/inspector) | yes | stdio, HTTP | Verbatim `tools/list` plus an optional canary call |
 | [mcpo](https://github.com/open-webui/mcpo) | yes | stdio, HTTP | Generated OpenAPI document plus an optional POST canary |
-| [Codex CLI](https://github.com/openai/codex) | no | stdio | Converted function schemas from a local provider intercept; capture-only |
+| [Codex CLI](https://github.com/openai/codex) | no | stdio, HTTP | Converted function schemas from a local provider intercept; capture-only |
 | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | no | stdio | Converted input schemas from an isolated local base-URL intercept; capture-only |
 
-Codex runs under a throwaway `CODEX_HOME`. Claude Code runs with isolated `HOME` and `CLAUDE_CONFIG_DIR`, `--bare`, dummy auth, and a loopback-only model endpoint. Both stop after the tools-bearing request is captured, without logging in or contacting a model service. See [adapter profiles and frozen measurements](docs/adapters.md) for the tested versions and schema evidence.
+Codex runs with a clean environment and throwaway `HOME`/`CODEX_HOME`. HTTP header values reach Codex through generated environment-variable names referenced by its isolated TOML. Claude Code runs with isolated `HOME` and `CLAUDE_CONFIG_DIR`, `--bare`, dummy auth, and a loopback-only model endpoint. Both stop after the tools-bearing request is captured, without logging in or contacting a model service. See [adapter profiles and frozen measurements](docs/adapters.md) for the tested versions and schema evidence.
 
 Package-backed adapters resolve their latest release by default. Claude Code exercises the installed `claude` executable and reports its actual version. A `claude-code` pin is an exact requirement: the adapter reports `adapter-broken` without launching when the installed version differs. Pin versions when you need a fixed comparison:
 
@@ -74,11 +77,30 @@ mcp-crosscheck --http <url> [flags]               # streamable HTTP
 | `--adapters <a,b,c>` | Select adapters. Default: `inspector,mcpo`. |
 | `--canary '<tool>={json}'` | Round-trip one safe tool with exact arguments. |
 | `--env <K=V>` | Add an environment variable to the stdio server. Repeatable. |
+| `--header <Name: value>` | Add an HTTP target header. Repeatable; `--http` only. |
 | `--pin <name=version>` | Pin an adapter version. Repeatable. |
 | `--mcpo-with <spec>` | Add an `uvx --with` constraint for mcpo. Repeatable. |
 | `--artifacts <dir>` | Save ground truth, raw adapter captures, and `report.json`. |
 | `--timeout <seconds>` | Set the per-stage timeout. Default: `120`. |
+| `--baseline <file>` | Acknowledge matching reviewed rendering drift from a strict v1 baseline. |
+| `--update-baseline` | Replace entries for selected adapters that completed a safe comparison. Requires `--baseline`. |
 | `--json` | Write the report as JSON. Progress stays on stderr. |
+
+Header names are unique case-insensitively. Values are removed from crosscheck-owned diagnostics and reports, but the command line itself can be visible through shell history or process inspection. Inspector and mcpo also receive headers in child-process arguments. Use dummy credentials in tests when possible.
+
+## Baselines
+
+A baseline acknowledges rendering drift you have reviewed. It does not suppress adapter startup, handshake, canary, ground-truth, or run failures.
+
+```sh
+# create or refresh reviewed entries after an eligible run
+mcp-crosscheck --baseline ./crosscheck-baseline.json --update-baseline -- node ./dist/index.js
+
+# later runs fail only on new rendering drift
+mcp-crosscheck --baseline ./crosscheck-baseline.json -- node ./dist/index.js
+```
+
+Updates replace entries only for selected adapters that returned a surface; unselected entries stay intact. Any selected runtime or canary failure leaves the file byte-for-byte unchanged. A successful update is reconciled against the new file immediately, so accepted findings do not make the update command fail. Stale entries are informational and remain in read-only mode until the next eligible update.
 
 ## Programmatic API
 
@@ -106,7 +128,7 @@ bun install
 bun run devcheck
 ```
 
-Raw `codex.request.json` and `claude-code.request.json` artifacts can contain prompt, session, and client metadata. Write them only to an explicitly selected local directory and treat that directory as sensitive.
+All `--artifacts` output is local-sensitive. `ground-truth.json` and `mcpo.openapi.json` can contain server-controlled data; raw `codex.request.json` and `claude-code.request.json` can also contain prompt, session, and client metadata. Exact header-value redaction applies to crosscheck-owned diagnostics and reports, not arbitrary server echoes or raw captures.
 
 The default suite is hermetic. Set `CROSSCHECK_E2E_NETWORK=1` to exercise Inspector and mcpo at their current releases, `CROSSCHECK_E2E_CODEX=1` for Codex, or `CROSSCHECK_E2E_CLAUDE_CODE=1` for the installed Claude Code client.
 

@@ -50,7 +50,11 @@ function packageSpec(ctx: AdapterContext): string {
 function baseArgs(ctx: AdapterContext): string[] {
   const { target } = ctx;
   if (target.kind === 'http') {
-    return ['-y', packageSpec(ctx), '--cli', target.url, '--transport', 'http'];
+    const headerFlags = Object.entries(target.headers ?? {}).flatMap(([name, value]) => [
+      '--header',
+      `${name}: ${value}`,
+    ]);
+    return ['-y', packageSpec(ctx), '--cli', target.url, '--transport', 'http', ...headerFlags];
   }
   const envFlags = Object.entries(target.env).flatMap(([key, value]) => ['-e', `${key}=${value}`]);
   return ['-y', packageSpec(ctx), '--cli', ...envFlags, target.command, ...target.args];
@@ -129,7 +133,7 @@ async function runCanary(
   if (result.code !== 0) {
     return {
       attempted: true,
-      detail: excerpt(result.stderr === '' ? result.stdout : result.stderr),
+      detail: ctx.redact(excerpt(result.stderr === '' ? result.stdout : result.stderr)),
       ok: false,
     };
   }
@@ -140,7 +144,11 @@ async function runCanary(
   if (parsed.data.isError === true) {
     const first = parsed.data.content?.[0];
     const text = first !== undefined && typeof first.text === 'string' ? first.text : 'isError';
-    return { attempted: true, detail: excerpt(`server rejected the call — ${text}`), ok: false };
+    return {
+      attempted: true,
+      detail: ctx.redact(excerpt(`server rejected the call — ${text}`)),
+      ok: false,
+    };
   }
   return { attempted: true, detail: null, ok: true };
 }
@@ -175,7 +183,7 @@ async function run(ctx: AdapterContext): Promise<AdapterRunResult> {
 
   const parsed = ListToolsOutput.safeParse(parseJsonLoose(result.stdout));
   if (result.code !== 0 || !parsed.success) {
-    const stderr = excerpt(result.stderr === '' ? result.stdout : result.stderr);
+    const stderr = ctx.redact(excerpt(result.stderr === '' ? result.stdout : result.stderr));
     const installFailure = /npm (err|error)|E404|EOVERRIDE|ENOTFOUND/i.test(result.stderr);
     return finish({
       canary: null,

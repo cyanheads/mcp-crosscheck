@@ -10,6 +10,8 @@
  *   bun tests/fixture-server/server.ts
  *   MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=8901 bun tests/fixture-server/server.ts
  */
+import { randomUUID } from 'node:crypto';
+import { appendFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -60,11 +62,71 @@ function createFixtureServer(): Server {
  * mode refuses to reuse a transport across requests. The widening cast is the
  * same `exactOptionalPropertyTypes` gap worked around in src/ground-truth.ts.
  */
+function readBody(request: IncomingMessage): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    request.on('data', (chunk: Buffer) => chunks.push(chunk));
+    request.on('error', reject);
+    request.on('end', () => {
+      const text = Buffer.concat(chunks).toString('utf8');
+      try {
+        resolve(text === '' ? undefined : JSON.parse(text));
+      } catch {
+        reject(new Error('request body was not valid JSON'));
+      }
+    });
+  });
+}
+
+const transports = new Map<string, StreamableHTTPServerTransport>();
+
+async function recordRequest(request: IncomingMessage, body: unknown): Promise<void> {
+  const path = process.env.MCP_HTTP_RECORD_PATH;
+  if (path === undefined) return;
+  const headerName = process.env.MCP_REQUIRED_HEADER_NAME?.toLowerCase();
+  const header = headerName === undefined ? null : (request.headers[headerName] ?? null);
+  const rpcMethod =
+    typeof body === 'object' && body !== null && 'method' in body ? String(body.method) : null;
+  await appendFile(path, `${JSON.stringify({ header, method: request.method, rpcMethod })}\n`);
+}
+
 async function handleHttpRequest(request: IncomingMessage, response: ServerResponse) {
-  const transport = new StreamableHTTPServerTransport({});
-  response.on('close', () => void transport.close());
-  await createFixtureServer().connect(transport as Transport);
-  await transport.handleRequest(request, response);
+  const body = request.method === 'POST' ? await readBody(request) : undefined;
+  await recordRequest(request, body);
+
+  const headerName = process.env.MCP_REQUIRED_HEADER_NAME;
+  const expected = process.env.MCP_REQUIRED_HEADER_VALUE;
+  const supplied = headerName === undefined ? undefined : request.headers[headerName.toLowerCase()];
+  if (headerName !== undefined && (expected === undefined || supplied !== expected)) {
+    response.writeHead(401, { 'content-type': 'text/plain' });
+    response.end(`required header rejected: ${expected ?? ''}`);
+    return;
+  }
+  if (process.env.MCP_REJECT_HEADER === '1' && expected !== undefined) {
+    response.statusMessage = `controlled rejection ${expected}`;
+    response.writeHead(401, { 'content-type': 'text/plain' });
+    response.end(`controlled rejection: ${expected}`);
+    return;
+  }
+
+  const sessionId = request.headers['mcp-session-id'];
+  let transport = typeof sessionId === 'string' ? transports.get(sessionId) : undefined;
+  if (transport === undefined && request.method === 'POST' && sessionId === undefined) {
+    transport = new StreamableHTTPServerTransport({
+      enableJsonResponse: true,
+      onsessioninitialized: (initializedId) => {
+        transports.set(initializedId, transport!);
+      },
+      sessionIdGenerator: randomUUID,
+    });
+    await createFixtureServer().connect(transport as Transport);
+  }
+  if (transport === undefined) {
+    response.writeHead(400).end('unknown MCP session');
+    return;
+  }
+  await transport.handleRequest(request, response, body);
+  if (request.method === 'DELETE' && typeof sessionId === 'string') transports.delete(sessionId);
 }
 
 if (process.env.MCP_TRANSPORT_TYPE === 'http') {

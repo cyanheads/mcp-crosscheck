@@ -12,7 +12,7 @@ export type JsonSchema = Record<string, unknown>;
 /** The MCP server under test: a spawnable stdio command or a running streamable-http endpoint. */
 export type TargetSpec =
   | { kind: 'stdio'; command: string; args: string[]; env: Record<string, string> }
-  | { kind: 'http'; url: string };
+  | { kind: 'http'; headers?: Record<string, string>; url: string };
 
 /** A safe tool to round-trip through each adapter, with exact arguments. Never synthesized. */
 export interface CanarySpec {
@@ -102,9 +102,47 @@ export type RuleId =
   | 'required-dropped'
   | 'tool-missing';
 
+/** Stable machine facts carried by a finding; human `detail` is never an identity source. */
+export type FindingEvidence =
+  | { kind: 'adapter-broken' }
+  | { kind: 'anyof-ignored' }
+  | { kind: 'canary-failed' }
+  | { keywords: string[]; kind: 'constraint-dropped' }
+  | { kind: 'description-lost'; subject: 'property' | 'tool' }
+  | {
+      branchOnly: boolean;
+      expectedPropertyCount: number;
+      kind: 'input-empty';
+      scope: 'nested' | 'root';
+    }
+  | { kind: 'handshake-failure' }
+  | { declaredIn: 'branch' | 'root'; kind: 'property-missing' }
+  | { groundTruthType: string | null; kind: 'property-untyped' }
+  | { from: string; kind: 'property-retyped'; to: string }
+  | { kind: 'required-dropped'; names: string[] }
+  | { kind: 'tool-missing' }
+  | { kind: 'output-field-missing' }
+  | { groundTruthType: string | null; kind: 'output-field-untyped' }
+  | { from: string; kind: 'output-field-retyped'; to: string }
+  | { expectedPropertyCount: number; kind: 'output-root-empty' }
+  | { expectedPropertyCount: number; kind: 'output-nested-empty' };
+
+/** Rendering-only evidence accepted by a compatibility baseline. */
+export type BaselineEvidence = Exclude<
+  FindingEvidence,
+  { kind: 'adapter-broken' | 'canary-failed' | 'handshake-failure' }
+>;
+
+/** Rules that describe a rendered surface and may be acknowledged in a baseline. */
+export type BaselineableRuleId = Exclude<
+  RuleId,
+  'adapter-broken' | 'canary-failed' | 'handshake-failure'
+>;
+
 /** One divergence between ground truth and a rendered surface. */
 export interface Finding {
   detail: string;
+  evidence: FindingEvidence;
   /** `tool` or `tool.property` when the finding is scoped below the adapter. */
   path: string | null;
   rule: RuleId;
@@ -134,6 +172,8 @@ export interface AdapterContext {
   mcpoWith: string[];
   /** Adapter name → exact version, overriding the latest-floats default. */
   pins: Partial<Record<AdapterName, string>>;
+  /** Remove configured header values from crosscheck-owned diagnostics. */
+  redact: (text: string) => string;
   target: TargetSpec;
   timeoutMs: number;
   /** Empty scratch directory used as a neutral cwd so package managers resolve no manifest. */
@@ -168,10 +208,12 @@ export interface Adapter {
 
 /** Per-adapter slice of the final report. */
 export interface AdapterReport {
+  acknowledgedFindings: Finding[];
   adapter: AdapterName;
   canary: CanaryOutcome | null;
   durationMs: number;
   findings: Finding[];
+  newFindings: Finding[];
   resolvedVersion: string | null;
   status: AdapterRunResult['status'];
   statusDetail: string | null;
@@ -179,9 +221,32 @@ export interface AdapterReport {
   toolCount: number | null;
 }
 
+/** One reviewed rendering-finding identity in a version-1 baseline. */
+export interface BaselineEntry {
+  adapter: AdapterName;
+  evidence: BaselineEvidence;
+  path: string;
+  rule: BaselineableRuleId;
+}
+
+/** Strict persisted baseline document. */
+export interface BaselineDocument {
+  baselineVersion: 1;
+  entries: BaselineEntry[];
+}
+
+/** Informational report item for a reviewed finding no longer observed. */
+export interface BaselineDiagnostic {
+  adapter: AdapterName;
+  entry: BaselineEntry;
+  kind: 'stale';
+}
+
 /** The complete result of one crosscheck run. */
 export interface RunReport {
+  acknowledgedCount: number;
   adapters: AdapterReport[];
+  baselineDiagnostics: BaselineDiagnostic[];
   crosscheckVersion: string;
   failCount: number;
   groundTruth: {
@@ -193,5 +258,6 @@ export interface RunReport {
   };
   infoCount: number;
   pass: boolean;
+  staleCount: number;
   target: { kind: 'stdio'; command: string; args: string[] } | { kind: 'http'; url: string };
 }

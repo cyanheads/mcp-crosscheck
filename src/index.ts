@@ -8,7 +8,20 @@ export { claudeCodeAdapter, surfaceFromClaudeCodeBody } from './adapters/claude-
 export { surfaceFromCodexBody } from './adapters/codex.js';
 export { ADAPTERS, DEFAULT_ADAPTERS, isAdapterName } from './adapters/index.js';
 export { surfaceFromOpenApiDoc } from './adapters/mcpo.js';
-export { captureGroundTruth, runGroundTruthCanary } from './ground-truth.js';
+export {
+  BaselineValidationError,
+  baselineEntryFromFinding,
+  parseBaseline,
+  reconcileBaseline,
+  serializeBaseline,
+  updateBaseline,
+  writeBaselineAtomic,
+} from './baseline.js';
+export {
+  captureGroundTruth,
+  runGroundTruthCanary,
+  terminateGroundTruthSession,
+} from './ground-truth.js';
 export { buildFindings, compareSurface } from './invariants.js';
 export { renderHumanReport, toJsonReport } from './report.js';
 export type { CrosscheckOptions } from './run.js';

@@ -53,7 +53,7 @@ function tomlString(value: string): string {
   return JSON.stringify(value);
 }
 
-function buildConfigToml(target: Extract<TargetSpec, { kind: 'stdio' }>, port: number): string {
+function buildConfigToml(target: TargetSpec, port: number): string {
   const lines = [
     'model = "crosscheck-stub"',
     'model_provider = "crosscheck"',
@@ -64,9 +64,25 @@ function buildConfigToml(target: Extract<TargetSpec, { kind: 'stdio' }>, port: n
     'wire_api = "responses"',
     '',
     `[mcp_servers.${SERVER_KEY}]`,
+  ];
+  if (target.kind === 'http') {
+    lines.push(`url = ${tomlString(target.url)}`);
+    const headerEntries = Object.keys(target.headers ?? {}).map(
+      (name, index) => [name, `MCP_CROSSCHECK_TARGET_HEADER_${index}`] as const,
+    );
+    if (headerEntries.length > 0) {
+      lines.push(
+        `env_http_headers = { ${headerEntries
+          .map(([name, envName]) => `${tomlString(name)} = ${tomlString(envName)}`)
+          .join(', ')} }`,
+      );
+    }
+    return `${lines.join('\n')}\n`;
+  }
+  lines.push(
     `command = ${tomlString(target.command)}`,
     `args = [${target.args.map(tomlString).join(', ')}]`,
-  ];
+  );
   const envEntries = Object.entries(target.env);
   if (envEntries.length > 0) {
     lines.push('', `[mcp_servers.${SERVER_KEY}.env]`);
@@ -174,9 +190,6 @@ async function resolveVersion(ctx: AdapterContext, exec: Exec): Promise<string |
 
 async function run(ctx: AdapterContext): Promise<AdapterRunResult> {
   const startedAt = Date.now();
-  if (ctx.target.kind !== 'stdio') {
-    throw new Error('codex adapter supports stdio targets only');
-  }
   const target = ctx.target;
 
   const exec = ctx.exec ?? nodeExec;
@@ -186,13 +199,41 @@ async function run(ctx: AdapterContext): Promise<AdapterRunResult> {
   await writeFile(join(codexHome, 'config.toml'), buildConfigToml(target, port));
   ctx.log(`codex: resolved ${resolvedVersion ?? 'unknown version'}, intercept on :${port}`);
 
+  const path = process.env.PATH;
+  if (path === undefined || path === '') {
+    return {
+      adapter: 'codex',
+      canary: null,
+      durationMs: Date.now() - startedAt,
+      resolvedVersion,
+      status: 'adapter-broken',
+      statusDetail: 'PATH is required to launch the codex package runner',
+      surface: null,
+    };
+  }
+  const headerEnvironment =
+    target.kind === 'http'
+      ? Object.fromEntries(
+          Object.values(target.headers ?? {}).map((value, index) => [
+            `MCP_CROSSCHECK_TARGET_HEADER_${index}`,
+            value,
+          ]),
+        )
+      : {};
   const capture = await startCaptureServer(port);
   const proc = exec.spawn(
     'npx',
     ['-y', packageSpec(ctx), 'exec', '--skip-git-repo-check', 'ping'],
     {
       cwd: ctx.workDir,
-      env: { CODEX_HOME: codexHome },
+      env: {
+        CODEX_HOME: codexHome,
+        HOME: codexHome,
+        ...headerEnvironment,
+        NO_PROXY: '*',
+        PATH: path,
+      },
+      inheritEnv: false,
     },
   );
 
@@ -206,20 +247,22 @@ async function run(ctx: AdapterContext): Promise<AdapterRunResult> {
 
   const capturedOnly = { attempted: false, detail: 'codex adapter is capture-only', ok: null };
 
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<{ kind: 'timeout' }>((resolve) => {
+    timer = setTimeout(() => resolve({ kind: 'timeout' }), ctx.timeoutMs);
+  });
   try {
     const outcome = await Promise.race([
       capture.captured.then((body) => ({ body, kind: 'captured' }) as const),
       proc.exited.then(() => ({ kind: 'exited' }) as const),
-      new Promise<{ kind: 'timeout' }>((resolve) =>
-        setTimeout(() => resolve({ kind: 'timeout' }), ctx.timeoutMs),
-      ),
+      timeout,
     ]);
 
     if (outcome.kind === 'exited') {
       return finish({
         canary: null,
         status: 'adapter-broken',
-        statusDetail: `codex exited before issuing a model request — ${excerpt(proc.stderrTail())}`,
+        statusDetail: `codex exited before issuing a model request — ${ctx.redact(excerpt(proc.stderrTail()))}`,
         surface: null,
       });
     }
@@ -251,6 +294,7 @@ async function run(ctx: AdapterContext): Promise<AdapterRunResult> {
     }
     return finish({ canary: capturedOnly, status: 'ok', statusDetail: null, surface });
   } finally {
+    clearTimeout(timer);
     proc.kill();
     capture.close();
   }
@@ -261,6 +305,5 @@ export const codexAdapter: Adapter = {
   name: 'codex',
   optIn: true,
   run,
-  supports: (target: TargetSpec) =>
-    target.kind === 'stdio' ? true : 'codex adapter supports stdio targets only in this release',
+  supports: (_target: TargetSpec) => true,
 };

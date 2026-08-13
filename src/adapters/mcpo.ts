@@ -32,7 +32,10 @@ function uvxArgs(ctx: AdapterContext, port: number): string[] {
   const withFlags = ctx.mcpoWith.flatMap((constraint) => ['--with', constraint]);
   const base = [...withFlags, packageSpec(ctx), '--host', '127.0.0.1', '--port', String(port)];
   if (ctx.target.kind === 'http') {
-    return [...base, '--server-type', 'streamable-http', '--', ctx.target.url];
+    const headerEntries = Object.entries(ctx.target.headers ?? {});
+    const headerFlags =
+      headerEntries.length === 0 ? [] : ['--header', JSON.stringify(ctx.target.headers)];
+    return [...base, '--server-type', 'streamable-http', ...headerFlags, '--', ctx.target.url];
   }
   return [...base, '--', ctx.target.command, ...ctx.target.args];
 }
@@ -119,13 +122,13 @@ async function runCanary(ctx: AdapterContext, port: number): Promise<CanaryOutco
     if (!response.ok) {
       return {
         attempted: true,
-        detail: excerpt(`HTTP ${response.status} — ${response.text}`),
+        detail: ctx.redact(excerpt(`HTTP ${response.status} — ${response.text}`)),
         ok: false,
       };
     }
     return { attempted: true, detail: null, ok: true };
   } catch (error) {
-    return { attempted: true, detail: excerpt(String(error)), ok: false };
+    return { attempted: true, detail: ctx.redact(excerpt(String(error))), ok: false };
   }
 }
 
@@ -152,7 +155,7 @@ async function run(ctx: AdapterContext): Promise<AdapterRunResult> {
     const failure = await waitForReady({
       failFast: () =>
         proc.hasExited()
-          ? `mcpo exited before becoming ready — ${excerpt(proc.stderrTail())}`
+          ? `mcpo exited before becoming ready — ${ctx.redact(excerpt(proc.stderrTail()))}`
           : null,
       intervalMs: 500,
       probe: async () => (await fetchJson(openapiUrl, { timeoutMs: 5_000 })).ok,

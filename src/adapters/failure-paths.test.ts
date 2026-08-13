@@ -13,7 +13,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-
+import { createRedactor } from '../redact.js';
 import type { AdapterContext } from '../types.js';
 import type { Exec, ExecResult, ManagedProcess, SpawnOptions } from '../util/exec.js';
 import { claudeCodeAdapter } from './claude-code.js';
@@ -41,10 +41,11 @@ function context(exec: Exec, overrides: Partial<AdapterContext> = {}): AdapterCo
     // Pinning short-circuits version resolution, so no test reaches a registry.
     pins: {
       'claude-code': '2.1.231',
-      codex: '0.147.0',
+      codex: '0.147.0-alpha.6.5',
       inspector: '2.1.0',
       mcpo: '0.0.20',
     },
+    redact: (text) => text,
     target: { args: ['server.js'], command: 'node', env: {}, kind: 'stdio' },
     timeoutMs: 5_000,
     workDir,
@@ -135,6 +136,22 @@ describe('inspector', () => {
     );
     expect(result.status).toBe('handshake-failure');
     expect(result.statusDetail).toContain('Connection closed');
+  });
+
+  test('redacts a configured value from a controlled rejected response', async () => {
+    const secret = 'fixture-secret';
+    const result = await inspectorAdapter.run(
+      context(captureExec({ code: 1, stderr: `HTTP 401 — controlled rejection: ${secret}` }), {
+        redact: createRedactor([secret]),
+        target: {
+          headers: { 'X-Fixture-Auth': secret },
+          kind: 'http',
+          url: 'http://127.0.0.1:9000/mcp',
+        },
+      }),
+    );
+    expect(result.statusDetail).not.toContain(secret);
+    expect(result.statusDetail).toContain('[REDACTED]');
   });
 
   test('handshake-failure: the stage timed out, and the detail names the budget', async () => {
@@ -272,6 +289,33 @@ describe('inspector', () => {
     expect(result.canary?.ok).toBe(false);
     expect(result.canary?.detail).toContain('message is required');
   });
+
+  test('streamable-http forwards each configured header as a repeated flag', async () => {
+    const calls: string[][] = [];
+    await inspectorAdapter.run(
+      context(recordingExec(calls, { stdout: JSON.stringify({ tools: [] }) }), {
+        target: {
+          headers: { Authorization: 'Bearer dummy', 'X-Tenant': 'fixture' },
+          kind: 'http',
+          url: 'http://127.0.0.1:9000/mcp',
+        },
+      }),
+    );
+    expect(calls[0]).toEqual([
+      '-y',
+      '@modelcontextprotocol/inspector@2.1.0',
+      '--cli',
+      'http://127.0.0.1:9000/mcp',
+      '--transport',
+      'http',
+      '--header',
+      'Authorization: Bearer dummy',
+      '--header',
+      'X-Tenant: fixture',
+      '--method',
+      'tools/list',
+    ]);
+  });
 });
 
 const OPENAPI_DOC = JSON.stringify({
@@ -296,8 +340,9 @@ const OPENAPI_DOC = JSON.stringify({
 });
 
 /** Fake `uvx mcpo` that serves a document on the port it was told to listen on. */
-function openApiSpawn(document: string): Exec['spawn'] {
+function openApiSpawn(document: string, calls?: string[][]): Exec['spawn'] {
   return (_command, args) => {
+    calls?.push(args);
     const port = Number(args[args.indexOf('--port') + 1]);
     const server = http.createServer((request, response) => {
       response.writeHead(200, { 'content-type': 'application/json' });
@@ -349,20 +394,49 @@ describe('mcpo', () => {
     expect(result.surface?.tools.map((tool) => tool.name)).toEqual(['echo_message']);
     expect(result.canary).toEqual({ attempted: true, detail: null, ok: true });
   });
+
+  test('streamable-http passes one JSON header map before the target separator', async () => {
+    const calls: string[][] = [];
+    await mcpoAdapter.run(
+      context(spawnExec(openApiSpawn(OPENAPI_DOC, calls)), {
+        target: {
+          headers: { Authorization: 'Bearer dummy', 'X-Tenant': 'fixture' },
+          kind: 'http',
+          url: 'http://127.0.0.1:9000/mcp',
+        },
+      }),
+    );
+    const args = calls[0] ?? [];
+    const separator = args.indexOf('--');
+    expect(args.slice(separator - 2)).toEqual([
+      '--header',
+      JSON.stringify({ Authorization: 'Bearer dummy', 'X-Tenant': 'fixture' }),
+      '--',
+      'http://127.0.0.1:9000/mcp',
+    ]);
+  });
 });
 
 interface CodexFake {
+  args: () => string[];
   /** The config.toml the adapter wrote into the throwaway CODEX_HOME. */
   config: () => string;
+  options: () => SpawnOptions;
   spawn: Exec['spawn'];
 }
 
 /** Fake `codex exec`: reads the intercept port out of config.toml and posts one request body. */
 function codexSpawn(body: unknown): CodexFake {
+  let args: string[] = [];
   let config = '';
+  let options: SpawnOptions = {};
   return {
+    args: () => args,
     config: () => config,
-    spawn: (_command, _args, opts) => {
+    options: () => options,
+    spawn: (_command, spawnedArgs, opts) => {
+      args = spawnedArgs;
+      options = opts;
       config = readFileSync(join(opts.env?.CODEX_HOME ?? '', 'config.toml'), 'utf8');
       const port = /127\.0\.0\.1:(\d+)/.exec(config)?.[1];
       void fetch(`http://127.0.0.1:${port}/v1/responses`, {
@@ -376,10 +450,10 @@ function codexSpawn(body: unknown): CodexFake {
 }
 
 describe('codex', () => {
-  test('rejects streamable-http targets', () => {
-    expect(codexAdapter.supports({ kind: 'http', url: 'https://example.com/mcp' })).toContain(
-      'stdio',
-    );
+  test('supports streamable-http targets', () => {
+    expect(
+      codexAdapter.supports({ headers: {}, kind: 'http', url: 'https://example.com/mcp' }),
+    ).toBe(true);
   });
 
   test('adapter-broken: codex exited before issuing a model request', async () => {
@@ -426,7 +500,28 @@ describe('codex', () => {
         },
       ],
     });
-    const result = await codexAdapter.run(context(spawnExec(fake.spawn)));
+    const timeoutMs = 33_333;
+    const realSetTimeout = globalThis.setTimeout;
+    const realClearTimeout = globalThis.clearTimeout;
+    const pending = new Set<ReturnType<typeof setTimeout>>();
+    globalThis.setTimeout = ((...args: Parameters<typeof setTimeout>) => {
+      const handle = realSetTimeout(...args);
+      if (args[1] === timeoutMs) pending.add(handle);
+      return handle;
+    }) as typeof setTimeout;
+    globalThis.clearTimeout = ((handle: Parameters<typeof clearTimeout>[0]) => {
+      pending.delete(handle as ReturnType<typeof setTimeout>);
+      realClearTimeout(handle);
+    }) as typeof clearTimeout;
+    let pendingAfterCapture = -1;
+    const result = await codexAdapter
+      .run(context(spawnExec(fake.spawn), { timeoutMs }))
+      .finally(() => {
+        pendingAfterCapture = pending.size;
+        globalThis.setTimeout = realSetTimeout;
+        globalThis.clearTimeout = realClearTimeout;
+        for (const handle of pending) realClearTimeout(handle);
+      });
     expect(result.status).toBe('ok');
     expect(result.surface?.tools.map((tool) => tool.name)).toEqual(['echo_message']);
     expect(result.canary).toEqual({
@@ -436,6 +531,97 @@ describe('codex', () => {
     });
     expect(fake.config()).toContain('[mcp_servers.target]');
     expect(fake.config()).toContain('command = "node"');
+    expect(pendingAfterCapture).toBe(0);
+    const port = /127\.0\.0\.1:(\d+)/.exec(fake.config())?.[1];
+    expect(fake.config()).toBe(`model = "crosscheck-stub"
+model_provider = "crosscheck"
+
+[model_providers.crosscheck]
+name = "mcp-crosscheck local intercept"
+base_url = "http://127.0.0.1:${port}/v1"
+wire_api = "responses"
+
+[mcp_servers.target]
+command = "node"
+args = ["server.js"]
+`);
+  });
+
+  test('streamable-http config uses url and environment-backed headers without secrets', async () => {
+    const artifactsDir = await mkdtemp(join(workDir, 'codex-http-artifacts-'));
+    const fake = codexSpawn({
+      tools: [
+        {
+          name: 'mcp__target',
+          tools: [{ name: 'echo', parameters: { type: 'object' } }],
+          type: 'namespace',
+        },
+      ],
+    });
+    const secret = 'dummy-secret-value';
+    try {
+      const result = await codexAdapter.run(
+        context(spawnExec(fake.spawn), {
+          artifactsDir,
+          target: {
+            headers: { Authorization: `Bearer ${secret}`, 'X-Tenant': 'fixture' },
+            kind: 'http',
+            url: 'http://127.0.0.1:9000/mcp',
+          },
+        }),
+      );
+      expect(result.status).toBe('ok');
+      expect(fake.config()).toContain('url = "http://127.0.0.1:9000/mcp"');
+      expect(fake.config()).toContain(
+        'env_http_headers = { "Authorization" = "MCP_CROSSCHECK_TARGET_HEADER_0", "X-Tenant" = "MCP_CROSSCHECK_TARGET_HEADER_1" }',
+      );
+      expect(fake.config()).not.toContain(secret);
+      expect(fake.config()).not.toContain('\nhttp_headers =');
+      expect(fake.args().join(' ')).not.toContain(secret);
+      expect(fake.options().inheritEnv).toBe(false);
+      expect(fake.options().env).toEqual({
+        CODEX_HOME: expect.any(String),
+        HOME: expect.any(String),
+        MCP_CROSSCHECK_TARGET_HEADER_0: `Bearer ${secret}`,
+        MCP_CROSSCHECK_TARGET_HEADER_1: 'fixture',
+        NO_PROXY: '*',
+        PATH: process.env.PATH as string,
+      });
+      for (const key of [
+        'OPENAI_API_KEY',
+        'OPENAI_BASE_URL',
+        'HTTP_PROXY',
+        'HTTPS_PROXY',
+        'AWS_PROFILE',
+      ]) {
+        expect(fake.options().env?.[key]).toBeUndefined();
+      }
+      expect(await readFile(join(artifactsDir, 'codex.request.json'), 'utf8')).not.toContain(
+        secret,
+      );
+    } finally {
+      await rm(artifactsDir, { force: true, recursive: true });
+    }
+  });
+
+  test('streamable-http without headers writes only the target URL', async () => {
+    const fake = codexSpawn({
+      tools: [
+        {
+          name: 'mcp__target',
+          tools: [{ name: 'echo', parameters: { type: 'object' } }],
+          type: 'namespace',
+        },
+      ],
+    });
+    const result = await codexAdapter.run(
+      context(spawnExec(fake.spawn), {
+        target: { headers: {}, kind: 'http', url: 'http://127.0.0.1:9000/mcp' },
+      }),
+    );
+    expect(result.status).toBe('ok');
+    expect(fake.config()).toContain('[mcp_servers.target]\nurl = "http://127.0.0.1:9000/mcp"\n');
+    expect(fake.config()).not.toContain('env_http_headers');
   });
 });
 
