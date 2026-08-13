@@ -1,6 +1,6 @@
 {
   "name": "mcp-crosscheck",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "Run real MCP clients against your server and diff what they render against what you advertise. Deterministic — no LLM calls, no API keys.",
   "type": "module",
   "bin": {

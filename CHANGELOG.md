@@ -2,6 +2,16 @@
 
 All notable changes to mcp-crosscheck are documented here.
 
+## 0.0.4 — 2026-08-13
+
+Harness range.
+
+- Added an opt-in Claude Code adapter that captures the installed client's rendered MCP declarations through an isolated loopback provider intercept, with exact installed-version pinning and a clean child environment. (#9)
+- Added frozen adapter profiles for Inspector, mcpo, Codex, and Claude Code, including the client versions and schema behavior measured against the bundled fixture. (#11)
+- Explicit-relative stdio command and argument paths now resolve before adapters enter their neutral scratch directory. (#18)
+- Adapter failure excerpts now anchor on terminal error lines while preserving truthful omission markers around truncated output. (#19)
+- Nested required-name loss, fully collapsed nested output objects, and explicit input/output type changes now produce scoped findings with regression coverage through nested objects and array items. (#20, #21, #22)
+
 ## 0.0.3 — 2026-08-09
 
 Engine depth.
