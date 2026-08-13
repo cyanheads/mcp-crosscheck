@@ -51,10 +51,14 @@ export interface RenderedProperty {
    */
   declaredIn: 'branch' | 'root';
   description: string | null;
+  /** Canonical explicit `type`; normalized surfaces populate it, while legacy producers may omit. */
+  explicitType?: string | null;
   /** Element schema when this property is an array; omitted when it declares no `items`. */
   items?: RenderedProperty;
   name: string;
   required: boolean;
+  /** Own schema-level `required` names; normalized surfaces populate it. */
+  requiredNames?: string[];
   /** Effective type, or null when the property carries no type information at all. */
   type: string | null;
 }
@@ -93,6 +97,7 @@ export type RuleId =
   | 'handshake-failure'
   | 'output-schema-divergence'
   | 'property-missing'
+  | 'property-retyped'
   | 'property-untyped'
   | 'required-dropped'
   | 'tool-missing';

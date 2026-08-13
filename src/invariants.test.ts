@@ -113,6 +113,30 @@ describe('compareSurface', () => {
     expect(untyped?.severity).toBe('fail');
   });
 
+  test('a changed explicit input type fails at its property path', () => {
+    const integerTool: GroundTruthTool = {
+      description: 'Set a count.',
+      inputSchema: {
+        properties: { count: { type: 'integer' } },
+        type: 'object',
+      },
+      name: 'set_count',
+    };
+    const rendered = renderedToolFromJsonSchema('set_count', 'Set a count.', {
+      properties: { count: { type: 'string' } },
+      type: 'object',
+    });
+
+    expect(compareSurface([integerTool], { tools: [rendered] })).toEqual([
+      {
+        detail: 'property explicit type changed from integer to string',
+        path: 'set_count.count',
+        rule: 'property-retyped',
+        severity: 'fail',
+      },
+    ]);
+  });
+
   test('enum alone still counts as type information', () => {
     const findings = compareSurface(
       [gtTool],
@@ -166,6 +190,31 @@ describe('compareSurface', () => {
     expect(dropped?.severity).toBe('fail');
   });
 
+  test('root required comparison preserves declared and undeclared names', () => {
+    const gt: GroundTruthTool = {
+      description: 'Configure retries.',
+      inputSchema: {
+        properties: { retries: { type: 'integer' } },
+        required: ['retries', 'timeoutMs'],
+        type: 'object',
+      },
+      name: 'configure',
+    };
+    const rendered = renderedToolFromJsonSchema('configure', 'Configure retries.', {
+      properties: { retries: { type: 'integer' } },
+      type: 'object',
+    });
+
+    expect(compareSurface([gt], { tools: [rendered] })).toEqual([
+      {
+        detail: 'required marker dropped for: retries, timeoutMs',
+        path: 'configure',
+        rule: 'required-dropped',
+        severity: 'fail',
+      },
+    ]);
+  });
+
   test('constraint-dropped is info severity', () => {
     const findings = compareSurface(
       [gtTool],
@@ -184,6 +233,80 @@ describe('compareSurface', () => {
     expect(dropped?.detail).toContain('maxLength');
     expect(dropped?.detail).toContain('minLength');
     expect(findings.filter((finding) => finding.severity === 'fail')).toEqual([]);
+  });
+
+  test('equivalent explicit type arrays compare canonically', () => {
+    const nullableTool: GroundTruthTool = {
+      description: 'Set a nullable label.',
+      inputSchema: {
+        properties: { label: { type: ['string', 'null'] } },
+        type: 'object',
+      },
+      name: 'set_label',
+    };
+    const rendered = renderedToolFromJsonSchema('set_label', 'Set a nullable label.', {
+      properties: { label: { type: ['null', 'string'] } },
+      type: 'object',
+    });
+
+    expect(compareSurface([nullableTool], { tools: [rendered] })).toEqual([]);
+  });
+
+  test('narrowing an explicit type array is a type change', () => {
+    const nullableTool: GroundTruthTool = {
+      description: 'Set a nullable label.',
+      inputSchema: {
+        properties: { label: { type: ['string', 'null'] } },
+        type: 'object',
+      },
+      name: 'set_label',
+    };
+    const rendered = renderedToolFromJsonSchema('set_label', 'Set a nullable label.', {
+      properties: { label: { type: 'string' } },
+      type: 'object',
+    });
+
+    expect(compareSurface([nullableTool], { tools: [rendered] })).toEqual([
+      {
+        detail: 'property explicit type changed from null|string to string',
+        path: 'set_label.label',
+        rule: 'property-retyped',
+        severity: 'fail',
+      },
+    ]);
+  });
+
+  test('inferred enum, const, and composition types are not explicit type changes', () => {
+    const inferredTool: GroundTruthTool = {
+      description: 'Accept inferred schemas.',
+      inputSchema: {
+        properties: {
+          allOfOnly: { allOf: [{ type: 'string' }] },
+          anyOfOnly: { anyOf: [{ type: 'string' }, { type: 'number' }] },
+          constant: { const: 7 },
+          oneOfOnly: { oneOf: [{ type: 'number' }] },
+          selected: { enum: ['a', 'b'] },
+        },
+        type: 'object',
+      },
+      name: 'inferred',
+    };
+    const rendered = renderedToolFromJsonSchema('inferred', 'Accept inferred schemas.', {
+      properties: {
+        allOfOnly: { type: 'string' },
+        anyOfOnly: { type: 'string' },
+        constant: { type: 'number' },
+        oneOfOnly: { type: 'number' },
+        selected: { type: 'string' },
+      },
+      type: 'object',
+    });
+
+    expect(
+      compareSurface([inferredTool], { tools: [rendered] }).filter(
+        (finding) => finding.rule === 'property-retyped',
+      ),
+    ).toEqual([]);
   });
 
   test('anyof-ignored is info severity', () => {
@@ -341,6 +464,22 @@ describe('nested comparison', () => {
     expect(findings[0]?.detail).toContain('integer');
   });
 
+  test('property-retyped at nested object depth', () => {
+    const findings = diff(
+      withTransport({ description: 'Per-request timeout.', minimum: 1, type: 'string' }, [
+        'timeoutMs',
+      ]),
+    );
+    expect(findings).toEqual([
+      {
+        detail: 'property explicit type changed from integer to string',
+        path: 'connect.config.transport.timeoutMs',
+        rule: 'property-retyped',
+        severity: 'fail',
+      },
+    ]);
+  });
+
   test('description-lost at depth 3', () => {
     const findings = diff(withTransport({ minimum: 1, type: 'integer' }, ['timeoutMs']));
     expect(findings.map((finding) => [finding.rule, finding.path])).toEqual([
@@ -366,6 +505,160 @@ describe('nested comparison', () => {
     expect(findings[0]?.severity).toBe('fail');
     expect(findings[0]?.path).toBe('connect.config.transport');
     expect(findings[0]?.detail).toContain('timeoutMs');
+  });
+
+  test('nested required comparison retains names the object never declares', () => {
+    const gt: GroundTruthTool = {
+      description: 'Configure retries.',
+      inputSchema: {
+        properties: {
+          config: {
+            properties: { retries: { type: 'integer' } },
+            required: ['retries', 'timeoutMs'],
+            type: 'object',
+          },
+        },
+        type: 'object',
+      },
+      name: 'configure',
+    };
+    const rendered = renderedToolFromJsonSchema('configure', 'Configure retries.', {
+      properties: {
+        config: {
+          properties: { retries: { type: 'integer' } },
+          type: 'object',
+        },
+      },
+      type: 'object',
+    });
+
+    expect(compareSurface([gt], { tools: [rendered] })).toEqual([
+      {
+        detail: 'required marker dropped for: retries, timeoutMs',
+        path: 'configure.config',
+        rule: 'required-dropped',
+        severity: 'fail',
+      },
+    ]);
+
+    expect(
+      compareSurface([gt], {
+        tools: [renderedToolFromJsonSchema('configure', 'Configure retries.', gt.inputSchema)],
+      }),
+    ).toEqual([]);
+  });
+
+  test('a required-only nested object compares its raw required names', () => {
+    const gt: GroundTruthTool = {
+      description: 'Configure transport.',
+      inputSchema: {
+        properties: {
+          transport: { required: ['timeoutMs'], type: 'object' },
+        },
+        type: 'object',
+      },
+      name: 'configure',
+    };
+    const rendered = renderedToolFromJsonSchema('configure', 'Configure transport.', {
+      properties: { transport: { type: 'object' } },
+      type: 'object',
+    });
+
+    expect(compareSurface([gt], { tools: [rendered] })).toEqual([
+      {
+        detail: 'required marker dropped for: timeoutMs',
+        path: 'configure.transport',
+        rule: 'required-dropped',
+        severity: 'fail',
+      },
+    ]);
+  });
+
+  test('a required-only object array item compares its raw required names', () => {
+    const gt: GroundTruthTool = {
+      description: 'Configure transports.',
+      inputSchema: {
+        properties: {
+          transports: {
+            items: { required: ['timeoutMs'], type: 'object' },
+            type: 'array',
+          },
+        },
+        type: 'object',
+      },
+      name: 'configure_many',
+    };
+    const rendered = renderedToolFromJsonSchema('configure_many', 'Configure transports.', {
+      properties: {
+        transports: { items: { type: 'object' }, type: 'array' },
+      },
+      type: 'object',
+    });
+
+    expect(compareSurface([gt], { tools: [rendered] })).toEqual([
+      {
+        detail: 'required marker dropped for: timeoutMs',
+        path: 'configure_many.transports[]',
+        rule: 'required-dropped',
+        severity: 'fail',
+      },
+    ]);
+  });
+
+  test('old-shape rendered properties stay compatible', () => {
+    const gt: GroundTruthTool = {
+      description: 'Configure retries.',
+      inputSchema: {
+        properties: {
+          config: {
+            properties: { retries: { type: 'integer' } },
+            required: ['retries'],
+            type: 'object',
+          },
+        },
+        type: 'object',
+      },
+      name: 'configure',
+    };
+    const oldShapeSurface: RenderedSurface = {
+      tools: [
+        {
+          description: 'Configure retries.',
+          hasRootUnion: false,
+          name: 'configure',
+          properties: [
+            {
+              children: [
+                {
+                  constraints: {},
+                  declaredIn: 'root',
+                  description: null,
+                  name: 'retries',
+                  required: false,
+                  type: 'string',
+                },
+              ],
+              constraints: {},
+              declaredIn: 'root',
+              description: null,
+              name: 'config',
+              required: false,
+              type: 'object',
+            },
+          ],
+          requiredNames: [],
+        },
+      ],
+    };
+
+    expect(compareSurface([gt], oldShapeSurface)).toEqual([
+      {
+        detail: 'required marker dropped for: retries',
+        path: 'configure.config',
+        rule: 'required-dropped',
+        severity: 'fail',
+      },
+    ]);
   });
 
   test('array element schemas are compared under a [] path segment', () => {
@@ -402,6 +695,71 @@ describe('nested comparison', () => {
     ]);
   });
 
+  test('property-retyped applies to array item schemas', () => {
+    const listTool: GroundTruthTool = {
+      description: 'Store values.',
+      inputSchema: {
+        properties: { values: { items: { type: 'integer' }, type: 'array' } },
+        type: 'object',
+      },
+      name: 'store',
+    };
+    const rendered = renderedToolFromJsonSchema('store', 'Store values.', {
+      properties: { values: { items: { type: 'string' }, type: 'array' } },
+      type: 'object',
+    });
+
+    expect(compareSurface([listTool], { tools: [rendered] })).toEqual([
+      {
+        detail: 'property explicit type changed from integer to string',
+        path: 'store.values[]',
+        rule: 'property-retyped',
+        severity: 'fail',
+      },
+    ]);
+  });
+
+  test('object-valued array items compare their raw required names', () => {
+    const listTool: GroundTruthTool = {
+      description: 'Store values.',
+      inputSchema: {
+        properties: {
+          values: {
+            items: {
+              properties: { value: { type: 'integer' } },
+              required: ['value', 'unit'],
+              type: 'object',
+            },
+            type: 'array',
+          },
+        },
+        type: 'object',
+      },
+      name: 'store',
+    };
+    const rendered = renderedToolFromJsonSchema('store', 'Store values.', {
+      properties: {
+        values: {
+          items: {
+            properties: { value: { type: 'integer' } },
+            type: 'object',
+          },
+          type: 'array',
+        },
+      },
+      type: 'object',
+    });
+
+    expect(compareSurface([listTool], { tools: [rendered] })).toEqual([
+      {
+        detail: 'required marker dropped for: value, unit',
+        path: 'store.values[]',
+        rule: 'required-dropped',
+        severity: 'fail',
+      },
+    ]);
+  });
+
   test('an element schema the client never declared is not flagged', () => {
     const findings = diff(withTransport(faithfulTimeout, ['timeoutMs'])).filter((finding) =>
       finding.path?.includes('tags'),
@@ -421,6 +779,37 @@ describe('nested comparison', () => {
     expect(findings[0]?.rule).toBe('empty-request-body');
     expect(findings[0]?.severity).toBe('fail');
     expect(findings[0]?.path).toBe('connect.config');
+  });
+
+  test('collapsed input objects suppress raw required-name findings', () => {
+    const gt: GroundTruthTool = {
+      description: 'Configure retries.',
+      inputSchema: {
+        properties: {
+          config: {
+            properties: { retries: { type: 'integer' } },
+            required: ['retries', 'timeoutMs'],
+            type: 'object',
+          },
+        },
+        type: 'object',
+      },
+      name: 'configure',
+    };
+    const rendered = renderedToolFromJsonSchema('configure', 'Configure retries.', {
+      properties: { config: { type: 'object' } },
+      type: 'object',
+    });
+
+    expect(compareSurface([gt], { tools: [rendered] })).toEqual([
+      {
+        detail:
+          'ground truth declares 1 nested property here but the client rendered the object with none — every nested field would be dropped',
+        path: 'configure.config',
+        rule: 'empty-request-body',
+        severity: 'fail',
+      },
+    ]);
   });
 
   test('a collapsed object does not abort comparison of its siblings', () => {
@@ -665,12 +1054,165 @@ describe('output schema rendering', () => {
     const findings = diff({
       properties: {
         attempts: OUTPUT_SCHEMA.properties.attempts,
-        summary: { description: 'Aggregate outcome.', type: 'object' },
+        summary: {
+          description: 'Aggregate outcome.',
+          properties: { connected: {} },
+          type: 'object',
+        },
       },
       type: 'object',
     });
     expect(findings.map((finding) => [finding.rule, finding.path])).toEqual([
       ['output-schema-divergence', 'output:connect.summary.connected'],
+    ]);
+  });
+
+  test('fully dropped nested output objects collapse at the object path', () => {
+    const gt: GroundTruthTool = {
+      description: outputTool.description,
+      inputSchema: INPUT_SCHEMA,
+      name: outputTool.name,
+      outputSchema: {
+        properties: {
+          summary: {
+            properties: {
+              connected: { type: 'boolean' },
+              totalAttempts: { type: 'integer' },
+            },
+            type: 'object',
+          },
+        },
+        type: 'object',
+      },
+    };
+    const rendered = renderedToolFromJsonSchema('connect', 'Open a connection.', INPUT_SCHEMA);
+    rendered.outputProperties = renderedPropertiesFromJsonSchema({
+      properties: { summary: { type: 'object' } },
+      type: 'object',
+    });
+
+    expect(compareSurface([gt], { tools: [rendered] })).toEqual([
+      {
+        detail:
+          'ground truth declares 2 nested output fields here but the client rendered the object with none — every nested output field is absent',
+        path: 'output:connect.summary',
+        rule: 'output-schema-divergence',
+        severity: 'info',
+      },
+    ]);
+  });
+
+  test('fully dropped object-valued output array items collapse at the [] path', () => {
+    const findings = diff({
+      properties: {
+        attempts: {
+          description: 'One entry per attempt.',
+          items: { type: 'object' },
+          type: 'array',
+        },
+        summary: OUTPUT_SCHEMA.properties.summary,
+      },
+      type: 'object',
+    });
+
+    expect(findings).toEqual([
+      {
+        detail:
+          'ground truth declares 1 nested output field here but the client rendered the object with none — every nested output field is absent',
+        path: 'output:connect.attempts[]',
+        rule: 'output-schema-divergence',
+        severity: 'info',
+      },
+    ]);
+  });
+
+  test('partially rendered nested output objects report only missing descendants', () => {
+    const gt: GroundTruthTool = {
+      description: outputTool.description,
+      inputSchema: INPUT_SCHEMA,
+      name: outputTool.name,
+      outputSchema: {
+        properties: {
+          summary: {
+            properties: {
+              connected: { type: 'boolean' },
+              totalAttempts: { type: 'integer' },
+            },
+            type: 'object',
+          },
+        },
+        type: 'object',
+      },
+    };
+    const rendered = renderedToolFromJsonSchema('connect', 'Open a connection.', INPUT_SCHEMA);
+    rendered.outputProperties = renderedPropertiesFromJsonSchema({
+      properties: {
+        summary: {
+          properties: { connected: { type: 'boolean' } },
+          type: 'object',
+        },
+      },
+      type: 'object',
+    });
+
+    expect(compareSurface([gt], { tools: [rendered] })).toEqual([
+      {
+        detail: 'output field is missing from the rendered result model',
+        path: 'output:connect.summary.totalAttempts',
+        rule: 'output-schema-divergence',
+        severity: 'info',
+      },
+    ]);
+  });
+
+  test('an output collapse does not stop comparison of sibling fields', () => {
+    const findings = diff({
+      properties: {
+        attempts: { type: 'string' },
+        summary: { type: 'object' },
+      },
+      type: 'object',
+    });
+
+    expect(findings).toEqual([
+      {
+        detail: 'output field explicit type changed from array to string',
+        path: 'output:connect.attempts',
+        rule: 'output-schema-divergence',
+        severity: 'info',
+      },
+      {
+        detail:
+          'ground truth declares 1 nested output field here but the client rendered the object with none — every nested output field is absent',
+        path: 'output:connect.summary',
+        rule: 'output-schema-divergence',
+        severity: 'info',
+      },
+    ]);
+  });
+
+  test('changed explicit output types stay info at nested depth', () => {
+    const findings = diff({
+      properties: {
+        attempts: OUTPUT_SCHEMA.properties.attempts,
+        summary: {
+          description: 'Aggregate outcome.',
+          properties: {
+            connected: { description: 'Any attempt succeeded.', type: 'string' },
+          },
+          type: 'object',
+        },
+      },
+      type: 'object',
+    });
+
+    expect(findings).toEqual([
+      {
+        detail: 'output field explicit type changed from boolean to string',
+        path: 'output:connect.summary.connected',
+        rule: 'output-schema-divergence',
+        severity: 'info',
+      },
     ]);
   });
 

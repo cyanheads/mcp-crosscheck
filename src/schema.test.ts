@@ -75,7 +75,22 @@ describe('renderedToolFromJsonSchema', () => {
     expect(message?.type).toBe('string');
     expect(message?.description).toBe('The message.');
     expect(message?.required).toBe(true);
+    expect(message?.requiredNames).toEqual([]);
+    expect(message?.explicitType).toBe('string');
     expect(message?.constraints).toEqual({ maxLength: 10 });
+  });
+
+  test('normalizes explicit type arrays without coercion', () => {
+    const tool = renderedToolFromJsonSchema('types', null, {
+      properties: {
+        malformed: { type: ['string', 7] },
+        nullable: { type: ['string', 'null'] },
+      },
+      type: 'object',
+    });
+
+    expect(tool.properties[0]?.explicitType).toBeNull();
+    expect(tool.properties[1]?.explicitType).toBe('null|string');
   });
 
   test('resolves $ref properties against an enclosing document', () => {
@@ -162,6 +177,23 @@ describe('nested normalization', () => {
     expect(transport?.required).toBe(true);
     expect(tags?.required).toBe(false);
     expect(transport?.children?.[0]?.required).toBe(true);
+    expect(config?.requiredNames).toEqual(['transport']);
+    expect(transport?.requiredNames).toEqual(['timeoutMs']);
+  });
+
+  test('nested raw required names include names the object does not declare', () => {
+    const nested = renderedToolFromJsonSchema('configure', null, {
+      properties: {
+        config: {
+          properties: { retries: { type: 'integer' } },
+          required: ['retries', 'timeoutMs'],
+          type: 'object',
+        },
+      },
+      type: 'object',
+    });
+
+    expect(nested.properties[0]?.requiredNames).toEqual(['retries', 'timeoutMs']);
   });
 
   test('nested descriptions and constraints are extracted at every level', () => {
@@ -174,6 +206,24 @@ describe('nested normalization', () => {
   test('array element schemas normalize as an item node', () => {
     expect(tags?.items?.type).toBe('object');
     expect(tags?.items?.children?.map((child) => child.name)).toEqual(['name']);
+  });
+
+  test('object-valued array items retain their own raw required names', () => {
+    const array = renderedToolFromJsonSchema('tag', null, {
+      properties: {
+        tags: {
+          items: {
+            properties: { name: { type: 'string' } },
+            required: ['name', 'color'],
+            type: 'object',
+          },
+          type: 'array',
+        },
+      },
+      type: 'object',
+    });
+
+    expect(array.properties[0]?.items?.requiredNames).toEqual(['name', 'color']);
   });
 
   test('tuple-form items are not descended into', () => {
@@ -203,6 +253,7 @@ describe('nested normalization', () => {
       $defs: {
         transport: {
           properties: { timeoutMs: { description: 'Refd timeout.', type: 'integer' } },
+          required: ['timeoutMs', 'endpoint'],
           type: 'object',
         },
       },
@@ -215,6 +266,7 @@ describe('nested normalization', () => {
     const nested = refd.properties[0]?.children?.[0];
     expect(nested?.type).toBe('object');
     expect(nested?.children?.[0]?.description).toBe('Refd timeout.');
+    expect(nested?.requiredNames).toEqual(['timeoutMs', 'endpoint']);
   });
 });
 
@@ -334,12 +386,24 @@ describe('union branch collection', () => {
   test('branch collection applies below the root too', () => {
     const tool = renderedToolFromJsonSchema('nested', null, {
       properties: {
-        filter: { anyOf: [{ properties: { since: { type: 'string' } } }], type: 'object' },
+        filter: {
+          anyOf: [
+            {
+              properties: { since: { type: 'string' } },
+              required: ['since', 'branchOnly'],
+            },
+          ],
+          required: ['since', 'containerOnly'],
+          type: 'object',
+        },
       },
       type: 'object',
     });
-    const since = tool.properties[0]?.children?.[0];
+    const filter = tool.properties[0];
+    const since = filter?.children?.[0];
     expect(since?.name).toBe('since');
     expect(since?.declaredIn).toBe('branch');
+    expect(since?.required).toBe(true);
+    expect(filter?.requiredNames).toEqual(['since', 'containerOnly']);
   });
 });

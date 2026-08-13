@@ -38,8 +38,8 @@ Exit codes: `0` pass, `1` findings or runtime failure, `2` usage error.
 
 | Tier | Findings |
 |:--|:--|
-| **fail** | Missing tools or input properties; empty request bodies; properties rendered without type information; lost descriptions or `required` markers; adapter launch, MCP handshake, or canary failures |
-| **info** | Dropped constraints such as `enum`, `minimum`, and `pattern`; ignored root `anyOf`/`oneOf`; missing or untyped `outputSchema` fields |
+| **fail** | Missing tools or input properties; empty request bodies; properties rendered without type information or with a changed explicit type; lost descriptions or `required` markers; adapter launch, MCP handshake, or canary failures |
+| **info** | Dropped constraints such as `enum`, `minimum`, and `pattern`; ignored root `anyOf`/`oneOf`; missing, untyped, or explicitly retyped `outputSchema` fields |
 
 Input checks recurse through nested objects and array items. When an adapter exposes a result model, output-schema drift stays informational because it can mislead a model about a result but does not drop an argument.
 

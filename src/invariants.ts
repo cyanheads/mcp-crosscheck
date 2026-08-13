@@ -25,6 +25,15 @@ function propertyNoun(count: number): string {
   return count === 1 ? 'property' : 'properties';
 }
 
+/** Raw required names, with the pre-metadata child flags as a compatibility fallback. */
+function requiredNamesOf(property: RenderedProperty): string[] {
+  return (
+    property.requiredNames ??
+    property.children?.filter((child) => child.required).map((child) => child.name) ??
+    []
+  );
+}
+
 /** Match rendered properties to ground-truth ones by name at one schema level. */
 function compareProperties(
   gtProperties: RenderedProperty[],
@@ -65,9 +74,8 @@ function compareNestedLevel(
   path: string,
 ): Finding[] {
   const gtChildren = gt.children ?? [];
-  if (gtChildren.length === 0) return [];
   const renderedChildren = rendered.children ?? [];
-  if (renderedChildren.length === 0) {
+  if (gtChildren.length > 0 && renderedChildren.length === 0) {
     return [
       {
         detail: `ground truth declares ${gtChildren.length} nested ${propertyNoun(
@@ -81,13 +89,10 @@ function compareNestedLevel(
   }
 
   const findings = compareProperties(gtChildren, renderedChildren, path);
-  const droppedRequired = gtChildren
-    .filter(
-      (child) =>
-        child.required &&
-        renderedChildren.find((candidate) => candidate.name === child.name)?.required !== true,
-    )
-    .map((child) => child.name);
+  const renderedRequiredNames = requiredNamesOf(rendered);
+  const droppedRequired = requiredNamesOf(gt).filter(
+    (name) => !renderedRequiredNames.includes(name),
+  );
   if (droppedRequired.length > 0) {
     findings.push({
       detail: `required marker dropped for: ${droppedRequired.join(', ')}`,
@@ -112,6 +117,18 @@ function compareProperty(
       detail: `property rendered with no type information (ground truth: ${gt.type ?? 'untyped'})`,
       path,
       rule: 'property-untyped',
+      severity: 'fail',
+    });
+  }
+  if (
+    typeof gt.explicitType === 'string' &&
+    typeof rendered.explicitType === 'string' &&
+    gt.explicitType !== rendered.explicitType
+  ) {
+    findings.push({
+      detail: `property explicit type changed from ${gt.explicitType} to ${rendered.explicitType}`,
+      path,
+      rule: 'property-retyped',
       severity: 'fail',
     });
   }
@@ -210,7 +227,33 @@ function compareOutputProperty(
       severity: 'info',
     });
   }
-  findings.push(...compareOutputProperties(gt.children ?? [], rendered.children ?? [], path));
+  if (
+    typeof gt.explicitType === 'string' &&
+    typeof rendered.explicitType === 'string' &&
+    gt.explicitType !== rendered.explicitType
+  ) {
+    findings.push({
+      detail: `output field explicit type changed from ${gt.explicitType} to ${rendered.explicitType}`,
+      path,
+      rule: 'output-schema-divergence',
+      severity: 'info',
+    });
+  }
+
+  const gtChildren = gt.children ?? [];
+  const renderedChildren = rendered.children ?? [];
+  if (gtChildren.length > 0 && renderedChildren.length === 0) {
+    findings.push({
+      detail: `ground truth declares ${gtChildren.length} nested output field${
+        gtChildren.length === 1 ? '' : 's'
+      } here but the client rendered the object with none — every nested output field is absent`,
+      path,
+      rule: 'output-schema-divergence',
+      severity: 'info',
+    });
+  } else {
+    findings.push(...compareOutputProperties(gtChildren, renderedChildren, path));
+  }
   if (gt.items !== undefined && rendered.items !== undefined) {
     findings.push(...compareOutputProperty(gt.items, rendered.items, `${path}[]`));
   }

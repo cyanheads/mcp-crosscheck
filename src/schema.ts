@@ -90,6 +90,20 @@ export function effectiveType(schema: JsonSchema, root: unknown): string | null 
   return null;
 }
 
+/** Canonicalize only an explicit JSON Schema `type` keyword for equality comparison. */
+export function explicitType(schema: JsonSchema): string | null {
+  const { type } = schema;
+  if (typeof type === 'string') return type;
+  if (
+    Array.isArray(type) &&
+    type.length > 0 &&
+    type.every((member): member is string => typeof member === 'string')
+  ) {
+    return [...type].sort().join('|');
+  }
+  return null;
+}
+
 /** Extract the constraint keywords present on a property schema. */
 export function extractConstraints(schema: JsonSchema): Record<string, unknown> {
   const constraints: Record<string, unknown> = {};
@@ -133,15 +147,26 @@ function propertyFrom(
 ): RenderedProperty {
   const resolved = resolveRef(rawSchema, doc);
   if (resolved === null) {
-    return { constraints: {}, declaredIn, description: null, name, required, type: null };
+    return {
+      constraints: {},
+      declaredIn,
+      description: null,
+      explicitType: null,
+      name,
+      required,
+      requiredNames: [],
+      type: null,
+    };
   }
   const schema = withRefSiblings(resolved, rawSchema);
   const property: RenderedProperty = {
     constraints: extractConstraints(schema),
     declaredIn,
     description: typeof schema.description === 'string' ? schema.description : null,
+    explicitType: explicitType(schema),
     name,
     required,
+    requiredNames: requiredNamesOf(schema),
     type: effectiveType(schema, doc),
   };
   // The visited set tracks the ref target, so a loop back to it is caught
