@@ -7,6 +7,7 @@
  *   3. inspector     — CROSSCHECK_E2E_NETWORK=1 (npx resolves the client)
  *   4. mcpo          — CROSSCHECK_E2E_NETWORK=1 and `uv` on PATH
  *   5. codex         — CROSSCHECK_E2E_CODEX=1 (boots the full Codex binary)
+ *   6. claude-code   — CROSSCHECK_E2E_CLAUDE_CODE=1 (installed Claude Code)
  *
  * Lanes 1 and 2 are what a bare `bun test` runs: no network, no binaries beyond
  * bun itself. The gated lanes resolve their clients at latest, so they belong in
@@ -63,6 +64,7 @@ const RELATIVE_STDIO_TARGET: TargetSpec = {
 
 const NETWORK_LANES = process.env.CROSSCHECK_E2E_NETWORK === '1';
 const CODEX_LANE = process.env.CROSSCHECK_E2E_CODEX === '1';
+const CLAUDE_CODE_LANE = process.env.CROSSCHECK_E2E_CLAUDE_CODE === '1';
 const HAS_UV = Bun.which('uv') !== null;
 
 /** Bun's reporter prints a skip count but not the names, so each gate says why it is off. */
@@ -72,6 +74,9 @@ if (!NETWORK_LANES) {
   console.error('[e2e] mcpo lane skipped — uv is not on PATH');
 }
 if (!CODEX_LANE) console.error('[e2e] codex lane skipped — set CROSSCHECK_E2E_CODEX=1');
+if (!CLAUDE_CODE_LANE) {
+  console.error('[e2e] claude-code lane skipped — set CROSSCHECK_E2E_CLAUDE_CODE=1');
+}
 
 function runCli(args: string[], timeoutMs = 60_000): Promise<ExecResult> {
   return execCapture(process.execPath, [CLI, ...args], { cwd: REPO_ROOT, timeoutMs });
@@ -243,6 +248,7 @@ describe('CLI process lane', () => {
     const result = await runCli(['--help']);
     expect(result.code).toBe(0);
     expect(result.stdout).toContain('mcp-crosscheck [flags]');
+    expect(result.stdout).toContain('claude-code');
   });
 
   test('--version prints the package version', async () => {
@@ -278,6 +284,12 @@ describe('CLI process lane', () => {
     const result = await runCli(['--canary', 'nope={}', '--', process.execPath, FIXTURE_SERVER]);
     expect(result.code).toBe(2);
     expect(result.stderr).toContain('not advertised by the server');
+  });
+
+  test('exits 2 when claude-code is selected for an HTTP target', async () => {
+    const result = await runCli(['--adapters', 'claude-code', '--http', 'http://127.0.0.1:1/mcp']);
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain('claude-code adapter supports stdio targets only');
   });
 });
 
@@ -411,5 +423,38 @@ describe.skipIf(!CODEX_LANE)('codex lane', () => {
       detail: 'codex adapter is capture-only',
       ok: null,
     });
+  }, 600_000);
+});
+
+describe.skipIf(!CLAUDE_CODE_LANE)('claude-code lane', () => {
+  test('captures the converted tool surface through the isolated base-URL intercept', async () => {
+    const result = await runCli(
+      [
+        '--adapters',
+        'claude-code',
+        '--pin',
+        'claude-code=2.1.231',
+        '--json',
+        '--',
+        process.execPath,
+        FIXTURE_SERVER,
+      ],
+      540_000,
+    );
+    const report = JSON.parse(result.stdout) as RunReport;
+    const [claudeCode] = report.adapters;
+    expect(claudeCode?.adapter).toBe('claude-code');
+    expect(claudeCode?.resolvedVersion).toBe('2.1.231');
+    expect(claudeCode?.status).toBe('ok');
+    expect(claudeCode?.toolCount).toBe(6);
+    expect(claudeCode?.canary).toEqual({
+      attempted: false,
+      detail: 'claude-code adapter is capture-only',
+      ok: null,
+    });
+    expect(claudeCode?.findings.map((finding) => finding.rule)).toEqual([
+      'anyof-ignored',
+      'anyof-ignored',
+    ]);
   }, 600_000);
 });

@@ -23,20 +23,20 @@ Usage:
   mcp-crosscheck --http <url> [flags]               running streamable-http server
 
 Flags:
-  --adapters <a,b,c>   Adapters to run (inspector, mcpo, codex). Default: inspector,mcpo.
-                       codex is opt-in: it boots the real Codex CLI against a local
-                       intercept — no login, no API traffic — but only runs when named.
+  --adapters <a,b,c>   Adapters: inspector, mcpo, codex, claude-code.
+                       Default: inspector,mcpo. Agent CLI captures are opt-in and use
+                       local intercepts without login or non-loopback API traffic.
   --canary '<tool>={json}'
                        Safe tool to round-trip through each adapter with exactly these
                        args (e.g. --canary 'echo_message={"message":"probe"}').
                        Verified against ground truth first. Never synthesized.
   --env <K=V>          Environment variable for the spawned server (repeatable).
-  --pin <name=version> Pin an adapter version instead of latest (repeatable),
-                       e.g. --pin mcpo=0.0.20.
+  --pin <name=version> Pin an adapter version (repeatable), e.g. --pin mcpo=0.0.20.
+                       claude-code requires the installed version to match its pin.
   --mcpo-with <spec>   Extra uvx --with dependency constraint for mcpo (repeatable),
                        e.g. --mcpo-with 'mcp<2'.
   --artifacts <dir>    Save the report and raw captures (report.json, ground truth,
-                       openapi.json, codex request).
+                       openapi.json, codex request, claude-code request).
   --timeout <seconds>  Per-stage timeout. Default: 120.
   --json               Machine-readable report on stdout.
   -h, --help           This help.
@@ -82,7 +82,7 @@ function parseAdapters(raw: string): AdapterName[] {
   return names.map((name) => {
     if (!isAdapterName(name)) {
       throw new CrosscheckUsageError(
-        `unknown adapter "${name}" — known adapters: inspector, mcpo, codex`,
+        `unknown adapter "${name}" — known adapters: inspector, mcpo, codex, claude-code`,
       );
     }
     return name;

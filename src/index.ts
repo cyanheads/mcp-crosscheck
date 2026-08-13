@@ -4,6 +4,7 @@
  * capture, invariant engine, adapters, report rendering) individually.
  */
 
+export { claudeCodeAdapter, surfaceFromClaudeCodeBody } from './adapters/claude-code.js';
 export { surfaceFromCodexBody } from './adapters/codex.js';
 export { ADAPTERS, DEFAULT_ADAPTERS, isAdapterName } from './adapters/index.js';
 export { surfaceFromOpenApiDoc } from './adapters/mcpo.js';

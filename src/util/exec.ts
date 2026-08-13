@@ -22,9 +22,14 @@ export interface ExecResult {
   timedOut: boolean;
 }
 
-export interface ExecOptions {
+export interface SpawnOptions {
   cwd?: string;
   env?: Record<string, string>;
+  /** False starts the child with only `env`; omitted preserves inherited-environment behavior. */
+  inheritEnv?: boolean;
+}
+
+export interface ExecOptions extends SpawnOptions {
   timeoutMs: number;
 }
 
@@ -48,15 +53,11 @@ export function killTree(child: ChildProcess): void {
   }
 }
 
-function spawnDetached(
-  command: string,
-  args: string[],
-  opts: { cwd?: string; env?: Record<string, string> },
-): ChildProcess {
+function spawnDetached(command: string, args: string[], opts: SpawnOptions): ChildProcess {
   return spawn(command, args, {
     ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
     detached: process.platform !== 'win32',
-    env: { ...process.env, ...opts.env },
+    env: opts.inheritEnv === false ? (opts.env ?? {}) : { ...process.env, ...opts.env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 }
@@ -105,11 +106,7 @@ export interface ManagedProcess {
 }
 
 /** Spawn a long-running child with rolling output tails and group teardown. */
-export function spawnManaged(
-  command: string,
-  args: string[],
-  opts: { cwd?: string; env?: Record<string, string> },
-): ManagedProcess {
+export function spawnManaged(command: string, args: string[], opts: SpawnOptions): ManagedProcess {
   const child = spawnDetached(command, args, opts);
   let stdoutTail = '';
   let stderrTail = '';
@@ -149,11 +146,7 @@ export function spawnManaged(
  */
 export interface Exec {
   capture(command: string, args: string[], opts: ExecOptions): Promise<ExecResult>;
-  spawn(
-    command: string,
-    args: string[],
-    opts: { cwd?: string; env?: Record<string, string> },
-  ): ManagedProcess;
+  spawn(command: string, args: string[], opts: SpawnOptions): ManagedProcess;
 }
 
 /** Real child processes — the default for every adapter run. */

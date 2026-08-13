@@ -119,8 +119,8 @@ export interface CanaryOutcome {
   ok: boolean | null;
 }
 
-/** Adapter identifiers. `codex` is opt-in — it boots the full Codex CLI binary. */
-export type AdapterName = 'codex' | 'inspector' | 'mcpo';
+/** Adapter identifiers. Capture-only agent CLIs are opt-in. */
+export type AdapterName = 'claude-code' | 'codex' | 'inspector' | 'mcpo';
 
 /** Everything an adapter needs to run hermetically. */
 export interface AdapterContext {

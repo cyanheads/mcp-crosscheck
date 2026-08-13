@@ -1,18 +1,20 @@
 /**
  * @file src/adapters/adapters.test.ts
  * Fixture-driven tests for the adapter surface parsers, using real captures
- * from live runs against mcp-ts-core's examples server (2026-08-09): a Codex
- * CLI 0.147.0 intercepted request body and an mcpo 0.0.20 openapi.json. These
- * lock the live-verified parsing behavior as regression tests.
+ * from live runs: a Codex CLI 0.147.0 intercepted request body and mcpo 0.0.20
+ * openapi.json from 2026-08-09, plus a Claude Code 2.1.231 request from
+ * 2026-08-13. These lock the live-verified parsing behavior as regressions.
  */
 
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-
+import { FIXTURE_TOOLS } from '../../tests/fixture-server/tools.js';
 import { compareSurface } from '../invariants.js';
-import type { GroundTruth } from '../types.js';
+import type { GroundTruth, GroundTruthTool } from '../types.js';
+import { surfaceFromClaudeCodeBody } from './claude-code.js';
 import { surfaceFromCodexBody } from './codex.js';
+import { ADAPTERS, DEFAULT_ADAPTERS } from './index.js';
 import { surfaceFromOpenApiDoc } from './mcpo.js';
 
 const FIXTURES = join(import.meta.dir, '..', '..', 'tests', 'fixtures');
@@ -30,9 +32,76 @@ const EXAMPLE_TOOLS = [
   'template_image_test',
   'template_madlibs_elicitation',
 ];
+const FIXTURE_TOOL_NAMES = FIXTURE_TOOLS.map((tool) => tool.name).sort();
+const FIXTURE_GROUND_TRUTH: GroundTruthTool[] = FIXTURE_TOOLS.map((tool) => ({
+  description: tool.description ?? null,
+  inputSchema: tool.inputSchema,
+  name: tool.name,
+  ...(tool.outputSchema === undefined ? {} : { outputSchema: tool.outputSchema }),
+}));
+
+test('claude-code is registered as opt-in without changing hermetic defaults', () => {
+  expect(Object.keys(ADAPTERS).sort()).toEqual(['claude-code', 'codex', 'inspector', 'mcpo']);
+  expect(ADAPTERS['claude-code'].optIn).toBe(true);
+  expect(DEFAULT_ADAPTERS).toEqual(['inspector', 'mcpo']);
+});
+
+describe('surfaceFromClaudeCodeBody', () => {
+  const fixture = loadFixture('claude-code-request.json');
+  const surface = surfaceFromClaudeCodeBody(fixture, 'fixture');
+
+  test('retains only tools while exercising native-tool filtering', () => {
+    expect(Object.keys(fixture as Record<string, unknown>)).toEqual(['tools']);
+    expect((fixture as { tools: unknown[] }).tools).toHaveLength(9);
+    expect(surface?.tools.map((tool) => tool.name).sort()).toEqual(FIXTURE_TOOL_NAMES);
+  });
+
+  test('normalizes descriptions, nested input schemas, and constraints', () => {
+    const nested = surface?.tools.find((tool) => tool.name === 'nested_config');
+    const config = nested?.properties.find((property) => property.name === 'config');
+    const transport = config?.children?.find((property) => property.name === 'transport');
+    const timeout = transport?.children?.find((property) => property.name === 'timeoutMs');
+    expect(nested?.description).not.toBeNull();
+    expect(config?.required).toBe(true);
+    expect(transport?.requiredNames).toEqual(['timeoutMs']);
+    expect(timeout?.type).toBe('integer');
+    expect(timeout?.constraints.minimum).toBe(1);
+  });
+
+  test('records only the observed root-union flattening', () => {
+    const findings = compareSurface(FIXTURE_GROUND_TRUTH, surface ?? { tools: [] });
+    expect(findings).toEqual([
+      expect.objectContaining({ path: 'union_modes', rule: 'anyof-ignored', severity: 'info' }),
+      expect.objectContaining({
+        path: 'branch_only_fields',
+        rule: 'anyof-ignored',
+        severity: 'info',
+      }),
+    ]);
+  });
+
+  test('exposes no rendered output surface', () => {
+    expect(surface?.tools.every((tool) => tool.outputProperties === undefined)).toBe(true);
+  });
+
+  test('returns null without exact mcp__target__ tool entries', () => {
+    expect(surfaceFromClaudeCodeBody({ tools: [{ name: 'Bash', input_schema: {} }] })).toBeNull();
+    expect(
+      surfaceFromClaudeCodeBody({
+        tools: [{ name: 'mcp__other__echo', input_schema: { type: 'object' } }],
+      }),
+    ).toBeNull();
+    expect(surfaceFromClaudeCodeBody({})).toBeNull();
+  });
+});
 
 describe('surfaceFromCodexBody', () => {
-  const surface = surfaceFromCodexBody(loadFixture('codex-request.json'));
+  const fixture = loadFixture('codex-request.json');
+  const surface = surfaceFromCodexBody(fixture);
+
+  test('the frozen request fixture retains only its parser-relevant tools payload', () => {
+    expect(Object.keys(fixture as Record<string, unknown>)).toEqual(['tools']);
+  });
 
   test('unwraps the mcp__ namespace and excludes codex-native tools', () => {
     expect(surface).not.toBeNull();

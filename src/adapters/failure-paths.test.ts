@@ -9,13 +9,14 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import type { AdapterContext } from '../types.js';
-import type { Exec, ExecResult, ManagedProcess } from '../util/exec.js';
+import type { Exec, ExecResult, ManagedProcess, SpawnOptions } from '../util/exec.js';
+import { claudeCodeAdapter } from './claude-code.js';
 import { codexAdapter } from './codex.js';
 import { inspectorAdapter } from './inspector.js';
 import { mcpoAdapter } from './mcpo.js';
@@ -38,7 +39,12 @@ function context(exec: Exec, overrides: Partial<AdapterContext> = {}): AdapterCo
     log: () => {},
     mcpoWith: [],
     // Pinning short-circuits version resolution, so no test reaches a registry.
-    pins: { codex: '0.147.0', inspector: '2.1.0', mcpo: '0.0.20' },
+    pins: {
+      'claude-code': '2.1.231',
+      codex: '0.147.0',
+      inspector: '2.1.0',
+      mcpo: '0.0.20',
+    },
     target: { args: ['server.js'], command: 'node', env: {}, kind: 'stdio' },
     timeoutMs: 5_000,
     workDir,
@@ -430,5 +436,233 @@ describe('codex', () => {
     });
     expect(fake.config()).toContain('[mcp_servers.target]');
     expect(fake.config()).toContain('command = "node"');
+  });
+});
+
+interface ClaudeCodeFake {
+  args: () => string[];
+  command: () => string;
+  config: () => string;
+  killed: () => number;
+  options: () => SpawnOptions;
+  port: () => number;
+  spawn: Exec['spawn'];
+}
+
+/** Fake installed `claude`: performs its observed HEAD probe, then posts the scripted bodies. */
+function claudeCodeSpawn(bodies: unknown[], onSpawn?: () => void): ClaudeCodeFake {
+  let args: string[] = [];
+  let command = '';
+  let config = '';
+  let killed = 0;
+  let options: SpawnOptions = {};
+  let port = 0;
+  return {
+    args: () => args,
+    command: () => command,
+    config: () => config,
+    killed: () => killed,
+    options: () => options,
+    port: () => port,
+    spawn: (spawnedCommand, spawnedArgs, opts) => {
+      command = spawnedCommand;
+      args = spawnedArgs;
+      options = opts;
+      const configPath = spawnedArgs[spawnedArgs.indexOf('--mcp-config') + 1] ?? '';
+      config = readFileSync(configPath, 'utf8');
+      const baseUrl = opts.env?.ANTHROPIC_BASE_URL ?? '';
+      port = Number(new URL(baseUrl).port);
+      onSpawn?.();
+      void (async () => {
+        try {
+          await fetch(`${baseUrl}/api/hello`, { method: 'HEAD' });
+          for (const body of bodies) {
+            await fetch(`${baseUrl}/v1/messages?beta=true`, {
+              body: JSON.stringify(body),
+              headers: { 'content-type': 'application/json' },
+              method: 'POST',
+            });
+          }
+        } catch {
+          /* adapter teardown can close the listener while the fake is still returning */
+        }
+      })();
+      return managed({ onKill: () => (killed += 1) });
+    },
+  };
+}
+
+/** Installed-Claude exec seam: version capture stays real to the adapter, process behavior is scripted. */
+function claudeCodeExec(
+  spawn: Exec['spawn'],
+  version: Partial<ExecResult> = { stdout: '2.1.231 (Claude Code)\n' },
+  captureCalls: [string, string[]][] = [],
+): Exec {
+  return {
+    capture: (command, args) => {
+      captureCalls.push([command, args]);
+      return Promise.resolve({ ...EXEC_DEFAULT, ...version });
+    },
+    spawn,
+  };
+}
+
+describe('claude-code', () => {
+  const TARGET_TOOL = {
+    description: 'Echo.',
+    input_schema: {
+      properties: { message: { description: 'Message.', type: 'string' } },
+      required: ['message'],
+      type: 'object',
+    },
+    name: 'mcp__target__echo_message',
+  };
+
+  test('rejects streamable-http targets', () => {
+    expect(claudeCodeAdapter.supports({ kind: 'http', url: 'https://example.com/mcp' })).toContain(
+      'stdio',
+    );
+  });
+
+  test('adapter-broken: the installed version does not satisfy --pin', async () => {
+    const result = await claudeCodeAdapter.run(
+      context(
+        claudeCodeExec(() => {
+          throw new Error('a mismatched pin must not spawn Claude Code');
+        }),
+        { pins: { 'claude-code': '2.1.230' } },
+      ),
+    );
+    expect(result.status).toBe('adapter-broken');
+    expect(result.resolvedVersion).toBe('2.1.231');
+    expect(result.statusDetail).toContain('does not match requested pin 2.1.230');
+  });
+
+  test('adapter-broken: the installed executable cannot report a version', async () => {
+    const result = await claudeCodeAdapter.run(
+      context(
+        claudeCodeExec(
+          () => {
+            throw new Error('a missing executable must not spawn');
+          },
+          { code: null, stderr: 'spawn claude ENOENT' },
+        ),
+      ),
+    );
+    expect(result.status).toBe('adapter-broken');
+    expect(result.statusDetail).toContain('spawn claude ENOENT');
+  });
+
+  test('adapter-broken: claude exited before issuing a tools-bearing request', async () => {
+    let killed = 0;
+    const result = await claudeCodeAdapter.run(
+      context(
+        claudeCodeExec(() =>
+          managed({ exited: true, onKill: () => (killed += 1), stderr: 'startup failed' }),
+        ),
+      ),
+    );
+    expect(result.status).toBe('adapter-broken');
+    expect(result.statusDetail).toContain('startup failed');
+    expect(killed).toBe(1);
+  });
+
+  test('handshake-failure: the first tools-bearing request has no configured MCP tools', async () => {
+    const fake = claudeCodeSpawn([{ tools: [{ input_schema: {}, name: 'Bash' }] }]);
+    const result = await claudeCodeAdapter.run(context(claudeCodeExec(fake.spawn)));
+    expect(result.status).toBe('handshake-failure');
+    expect(result.statusDetail).toContain('no MCP tools');
+    expect(fake.killed()).toBe(1);
+  });
+
+  test('handshake-failure: no tools-bearing request arrives within the budget', async () => {
+    const fake = claudeCodeSpawn([{ model: 'claude-opus-5' }]);
+    const result = await claudeCodeAdapter.run(
+      context(claudeCodeExec(fake.spawn), { timeoutMs: 300 }),
+    );
+    expect(result.status).toBe('handshake-failure');
+    expect(result.statusDetail).toBe('no tools-bearing model request captured within 300ms');
+    expect(fake.killed()).toBe(1);
+  });
+
+  test('ok: isolated installed-client capture preserves config, artifacts, and teardown', async () => {
+    const artifactsDir = await mkdtemp(join(workDir, 'claude-artifacts-'));
+    const body = {
+      metadata: { session_id: 'local-sensitive' },
+      tools: [{ input_schema: {}, name: 'Bash' }, TARGET_TOOL],
+    };
+    const captureCalls: [string, string[]][] = [];
+    const fake = claudeCodeSpawn([{ model: 'first request has no tools' }, body]);
+    try {
+      const result = await claudeCodeAdapter.run(
+        context(claudeCodeExec(fake.spawn, { stdout: '2.1.231 (Claude Code)\n' }, captureCalls), {
+          artifactsDir,
+          target: {
+            args: ['server.js'],
+            command: 'node',
+            env: { FIXTURE_TOKEN: 'preserved' },
+            kind: 'stdio',
+          },
+        }),
+      );
+      expect(result.status).toBe('ok');
+      expect(result.resolvedVersion).toBe('2.1.231');
+      expect(result.surface?.tools.map((tool) => tool.name)).toEqual(['echo_message']);
+      expect(result.canary).toEqual({
+        attempted: false,
+        detail: 'claude-code adapter is capture-only',
+        ok: null,
+      });
+      expect(captureCalls).toEqual([['claude', ['--version']]]);
+      expect(fake.command()).toBe('claude');
+      expect(fake.args()).toEqual([
+        '--bare',
+        '--strict-mcp-config',
+        '--mcp-config',
+        expect.any(String),
+        '--print',
+        'ping',
+      ]);
+      expect(JSON.parse(fake.config())).toEqual({
+        mcpServers: {
+          target: {
+            args: ['server.js'],
+            command: 'node',
+            env: { FIXTURE_TOKEN: 'preserved' },
+            type: 'stdio',
+          },
+        },
+      });
+      expect(fake.options().env?.HOME).toStartWith(workDir);
+      expect(fake.options().env?.CLAUDE_CONFIG_DIR).toStartWith(workDir);
+      expect(fake.options().env?.ANTHROPIC_API_KEY).toContain('dummy');
+      expect(fake.options().env?.ANTHROPIC_BASE_URL).toBe(`http://127.0.0.1:${fake.port()}`);
+      expect(fake.options().env?.NO_PROXY).toBe('*');
+      expect(fake.options().env?.PATH).toBe(process.env.PATH);
+      expect(fake.options().inheritEnv).toBe(false);
+      for (const key of [
+        'ANTHROPIC_AUTH_TOKEN',
+        'CLAUDE_CODE_USE_BEDROCK',
+        'HTTP_PROXY',
+        'HTTPS_PROXY',
+      ]) {
+        expect(fake.options().env?.[key]).toBeUndefined();
+      }
+      expect(Object.keys(fake.options().env ?? {}).sort()).toEqual([
+        'ANTHROPIC_API_KEY',
+        'ANTHROPIC_BASE_URL',
+        'CLAUDE_CONFIG_DIR',
+        'HOME',
+        'NO_PROXY',
+        'PATH',
+      ]);
+      expect(fake.killed()).toBe(1);
+      expect(
+        JSON.parse(await readFile(join(artifactsDir, 'claude-code.request.json'), 'utf8')),
+      ).toEqual(body);
+      await expect(fetch(`http://127.0.0.1:${fake.port()}/api/hello`)).rejects.toThrow();
+    } finally {
+      await rm(artifactsDir, { force: true, recursive: true });
+    }
   });
 });

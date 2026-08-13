@@ -6,7 +6,7 @@
  */
 import { describe, expect, test } from 'bun:test';
 
-import { excerpt, execCapture } from './exec.js';
+import { excerpt, execCapture, nodeExec } from './exec.js';
 
 /** The shape mcpo fails with when a fresh `uvx` resolve pulls an incompatible dependency. */
 const PYTHON_TRACEBACK = [
@@ -126,6 +126,26 @@ describe('excerpt', () => {
 });
 
 describe('execCapture', () => {
+  test('inherits the parent environment by default and supports an explicit clean one', async () => {
+    const printPath = 'console.log(JSON.stringify({ PATH: process.env.PATH }))';
+    const inherited = await execCapture(process.execPath, ['-e', printPath], {
+      timeoutMs: 30_000,
+    });
+    expect(JSON.parse(inherited.stdout)).toEqual({ PATH: process.env.PATH });
+
+    const clean = await execCapture(process.execPath, ['-e', printPath], {
+      inheritEnv: false,
+      timeoutMs: 30_000,
+    });
+    expect(JSON.parse(clean.stdout)).toEqual({});
+
+    const managed = nodeExec.spawn(process.execPath, ['-e', printPath], {
+      inheritEnv: false,
+    });
+    await managed.exited;
+    expect(JSON.parse(managed.stdoutTail())).toEqual({});
+  });
+
   test('captures stdout and the exit code', async () => {
     const result = await execCapture(process.execPath, ['-e', 'console.log("captured")'], {
       timeoutMs: 30_000,
