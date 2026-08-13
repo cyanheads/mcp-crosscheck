@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import { ADAPTERS } from './adapters/index.js';
 import { captureGroundTruth, runGroundTruthCanary } from './ground-truth.js';
 import { buildFindings } from './invariants.js';
+import { canonicalizeTarget } from './target.js';
 import type { AdapterName, AdapterReport, CanarySpec, RunReport, TargetSpec } from './types.js';
 import { VERSION } from './version.js';
 
@@ -33,13 +34,14 @@ export interface CrosscheckOptions {
 
 /** Run the full crosscheck: ground truth, canary preflight, every selected adapter. */
 export async function runCrosscheck(options: CrosscheckOptions): Promise<RunReport> {
+  const target = canonicalizeTarget(options.target, process.cwd());
   const log = options.log ?? (() => {});
   const timeoutMs = options.timeoutMs ?? 120_000;
   const canary = options.canary ?? null;
   const artifactsDir = options.artifactsDir ?? null;
 
   for (const name of options.adapters) {
-    const verdict = ADAPTERS[name].supports(options.target);
+    const verdict = ADAPTERS[name].supports(target);
     if (verdict !== true) {
       throw new CrosscheckUsageError(`adapter "${name}": ${verdict}`);
     }
@@ -52,7 +54,7 @@ export async function runCrosscheck(options: CrosscheckOptions): Promise<RunRepo
 
   try {
     log('capturing ground truth via the official MCP SDK client');
-    const groundTruth = await captureGroundTruth(options.target, timeoutMs);
+    const groundTruth = await captureGroundTruth(target, timeoutMs);
     log(
       `ground truth: ${groundTruth.serverName ?? 'unnamed server'} advertises ${groundTruth.tools.length} tool(s)`,
     );
@@ -70,7 +72,7 @@ export async function runCrosscheck(options: CrosscheckOptions): Promise<RunRepo
           `canary tool "${canary.tool}" is not advertised by the server`,
         );
       }
-      groundTruthCanary = await runGroundTruthCanary(options.target, canary, timeoutMs);
+      groundTruthCanary = await runGroundTruthCanary(target, canary, timeoutMs);
       if (groundTruthCanary.ok !== true) {
         throw new CrosscheckUsageError(
           `canary failed against ground truth — fix the canary spec before blaming a client${
@@ -90,7 +92,7 @@ export async function runCrosscheck(options: CrosscheckOptions): Promise<RunRepo
         log,
         mcpoWith: options.mcpoWith ?? [],
         pins: options.pins ?? {},
-        target: options.target,
+        target,
         timeoutMs,
         workDir,
       });
@@ -110,10 +112,10 @@ export async function runCrosscheck(options: CrosscheckOptions): Promise<RunRepo
     const failCount = allFindings.filter((finding) => finding.severity === 'fail').length;
     const infoCount = allFindings.filter((finding) => finding.severity === 'info').length;
 
-    const target: RunReport['target'] =
-      options.target.kind === 'http'
-        ? { kind: 'http', url: options.target.url }
-        : { args: options.target.args, command: options.target.command, kind: 'stdio' };
+    const reportTarget: RunReport['target'] =
+      target.kind === 'http'
+        ? { kind: 'http', url: target.url }
+        : { args: target.args, command: target.command, kind: 'stdio' };
 
     return {
       adapters: adapterReports,
@@ -128,7 +130,7 @@ export async function runCrosscheck(options: CrosscheckOptions): Promise<RunRepo
       },
       infoCount,
       pass: failCount === 0,
-      target,
+      target: reportTarget,
     };
   } finally {
     await rm(workDir, { force: true, recursive: true }).catch(() => {

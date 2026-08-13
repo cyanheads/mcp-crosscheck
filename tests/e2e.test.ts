@@ -12,8 +12,8 @@
  * bun itself. The gated lanes resolve their clients at latest, so they belong in
  * a deliberate run rather than the default suite.
  *
- * Every spawned target path is absolute: adapters run package runners from a
- * neutral scratch cwd, so a relative target would resolve against the wrong root.
+ * Explicit-relative stdio targets are resolved at the orchestration boundary.
+ * Adapter package runners still launch from a neutral scratch cwd.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
@@ -50,6 +50,12 @@ const CANARY: CanarySpec = { args: { message: 'probe', repeat: 2 }, tool: 'echo_
 const CANARY_FLAG = `${CANARY.tool}=${JSON.stringify(CANARY.args)}`;
 const STDIO_TARGET: TargetSpec = {
   args: [FIXTURE_SERVER],
+  command: process.execPath,
+  env: {},
+  kind: 'stdio',
+};
+const RELATIVE_STDIO_TARGET: TargetSpec = {
+  args: ['./tests/fixture-server/server.ts'],
   command: process.execPath,
   env: {},
   kind: 'stdio',
@@ -187,14 +193,14 @@ describe('hermetic core: streamable-http', () => {
 });
 
 describe('hermetic core: orchestration', () => {
-  test('assembles a report and persists ground truth with no adapters selected', async () => {
+  test('canonicalizes a relative programmatic target and persists ground truth', async () => {
     const artifactsDir = await mkdtemp(join(tmpdir(), 'crosscheck-e2e-'));
     try {
       const report = await runCrosscheck({
         adapters: [],
         artifactsDir,
         canary: CANARY,
-        target: STDIO_TARGET,
+        target: RELATIVE_STDIO_TARGET,
         timeoutMs: TIMEOUT_MS,
       });
       expect(report.pass).toBe(true);
@@ -276,7 +282,7 @@ describe('CLI process lane', () => {
 });
 
 describe.skipIf(!NETWORK_LANES)('inspector lane', () => {
-  test('renders every fixture tool verbatim and round-trips the canary', async () => {
+  test('resolves the relative fixture target before the neutral-cwd adapter run', async () => {
     const result = await runCli(
       [
         '--adapters',
@@ -288,13 +294,18 @@ describe.skipIf(!NETWORK_LANES)('inspector lane', () => {
         '--json',
         '--',
         process.execPath,
-        FIXTURE_SERVER,
+        './tests/fixture-server/server.ts',
       ],
       300_000,
     );
     expect(result.code).toBe(0);
     const report = JSON.parse(result.stdout) as RunReport;
     expect(report.pass).toBe(true);
+    expect(report.target).toEqual({
+      args: [FIXTURE_SERVER],
+      command: process.execPath,
+      kind: 'stdio',
+    });
     const [inspector] = report.adapters;
     expect(inspector?.adapter).toBe('inspector');
     expect(inspector?.status).toBe('ok');

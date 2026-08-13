@@ -92,6 +92,10 @@ const report = await runCrosscheck({
 console.log(report.pass, report.failCount);
 ```
 
+For stdio targets, command and argument tokens beginning with `./` or `../` are resolved
+lexically against the invoking process's current directory. Adapters still run their package
+runners from a neutral scratch directory so local manifests cannot shadow the selected client.
+
 The package also exports the ground-truth capture, schema normalizers, comparison engine, adapter parsers, and report renderers.
 
 ## Development
