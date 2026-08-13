@@ -2,6 +2,14 @@
 
 All notable changes to mcp-crosscheck are documented here.
 
+## 0.1.0 — 2026-08-13
+
+Launch.
+
+- Added portable Windows process lifecycle support: bare `npx` resolves through npm's Node entry point without a shell, timeouts and managed teardown terminate descendant trees with `taskkill`, and Node-core build helpers replace POSIX-only package scripts. Verified on Windows Node 22.21.0 with the built CLI, bundled fixture, timeout, and descendant cleanup. (#16)
+- Added a contributor guide and secret-safe GitHub issue forms for reproducible bug reports and deterministic adapter proposals, with local gate and opt-in client-lane coverage kept in sync with the repository. (#15)
+- Reconciled the public README, CLI flags, package metadata, archive contents, release history, and final Inspector, mcpo, Codex, and Claude Code verification lanes for the 0.1.0 release. (#17)
+
 ## 0.0.5 — 2026-08-13
 
 Operations.

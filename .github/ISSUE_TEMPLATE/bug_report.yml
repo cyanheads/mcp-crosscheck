@@ -1,0 +1,93 @@
+name: Bug report
+description: Report a reproducible mcp-crosscheck defect
+title: "bug: "
+labels:
+  - bug
+assignees:
+  - cyanheads
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve mcp-crosscheck. Replace credentials, auth headers, tokens, and private endpoints with placeholders. Raw `--artifacts` captures are local-sensitive and should not be uploaded.
+  - type: input
+    id: crosscheck_version
+    attributes:
+      label: mcp-crosscheck version
+      description: Run `mcp-crosscheck --version`.
+      placeholder: x.y.z
+    validations:
+      required: true
+  - type: dropdown
+    id: adapter
+    attributes:
+      label: Adapter
+      description: Select the affected adapter, or choose the adapter-independent option.
+      options:
+        - Not adapter-specific
+        - MCP Inspector
+        - mcpo
+        - Codex CLI
+        - Claude Code
+    validations:
+      required: true
+  - type: input
+    id: adapter_version
+    attributes:
+      label: Resolved client version
+      description: Copy the version from the report, or enter "not applicable" for adapter-independent or pre-report failures.
+      placeholder: 2.1.0 or not applicable
+    validations:
+      required: true
+  - type: dropdown
+    id: transport
+    attributes:
+      label: Target transport
+      options:
+        - stdio
+        - streamable HTTP
+        - Not reached
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Include OS, architecture, Node version, and Bun version.
+      placeholder: Windows 11, x64, Node 22.21.0, Bun 1.3.14
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Provide the smallest command that reproduces the problem. Replace credentials, headers, tokens, and private endpoints with placeholders.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: report
+    attributes:
+      label: Report or redacted output
+      description: Paste the JSON report or a redacted stdout/stderr excerpt. If the failure occurred before a report was produced, explain that here.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: checkboxes
+    id: redaction
+    attributes:
+      label: Sensitive data check
+      options:
+        - label: I reviewed commands, output, and attachments and removed credentials, auth headers, tokens, private endpoints, and other sensitive data.
+          required: true

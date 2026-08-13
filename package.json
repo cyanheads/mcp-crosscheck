@@ -1,7 +1,7 @@
 {
   "name": "mcp-crosscheck",
-  "version": "0.0.5",
-  "description": "Run real MCP clients against your server and diff what they render against what you advertise. Deterministic — no LLM calls, no API keys.",
+  "version": "0.1.0",
+  "description": "Run real MCP clients against your server and diff their rendered tool surface against tools/list. Deterministic — no LLM calls.",
   "type": "module",
   "bin": {
     "mcp-crosscheck": "dist/cli.js"
@@ -24,8 +24,8 @@
   },
   "homepage": "https://github.com/cyanheads/mcp-crosscheck#readme",
   "scripts": {
-    "build": "tsc -p tsconfig.build.json && chmod +x dist/cli.js",
-    "clean": "rm -rf dist .tsbuildinfo",
+    "build": "tsc -p tsconfig.build.json && node scripts/build.mjs finalize",
+    "clean": "node scripts/build.mjs clean",
     "rebuild": "bun run clean && bun run build",
     "typecheck": "tsc --noEmit",
     "lint": "biome check",
@@ -58,6 +58,7 @@
     "mcpo",
     "mcp-inspector",
     "codex",
+    "claude-code",
     "cli",
     "developer-tools"
   ],

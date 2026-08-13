@@ -34,6 +34,7 @@ npx mcp-crosscheck --adapters inspector,mcpo,codex,claude-code -- node ./dist/in
 ```
 
 Requires Node 22 or newer. The mcpo adapter also requires [`uv`](https://docs.astral.sh/uv/) on `PATH`.
+Windows support is verified on Node 22.21.0, including the built CLI, stdio fixture, timeout handling, and descendant process cleanup.
 
 Exit codes: `0` pass, `1` findings or runtime failure, `2` usage error.
 
@@ -85,6 +86,8 @@ mcp-crosscheck --http <url> [flags]               # streamable HTTP
 | `--baseline <file>` | Acknowledge matching reviewed rendering drift from a strict v1 baseline. |
 | `--update-baseline` | Replace entries for selected adapters that completed a safe comparison. Requires `--baseline`. |
 | `--json` | Write the report as JSON. Progress stays on stderr. |
+| `-h`, `--help` | Print CLI usage. |
+| `-V`, `--version` | Print the package version. |
 
 Header names are unique case-insensitively. Values are removed from crosscheck-owned diagnostics and reports, but the command line itself can be visible through shell history or process inspection. Inspector and mcpo also receive headers in child-process arguments. Use dummy credentials in tests when possible.
 
@@ -127,6 +130,8 @@ The package also exports the ground-truth capture, schema normalizers, compariso
 bun install
 bun run devcheck
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the local workflow, opt-in client lanes, and adapter constraints.
 
 All `--artifacts` output is local-sensitive. `ground-truth.json` and `mcpo.openapi.json` can contain server-controlled data; raw `codex.request.json` and `claude-code.request.json` can also contain prompt, session, and client metadata. Exact header-value redaction applies to crosscheck-owned diagnostics and reports, not arbitrary server echoes or raw captures.
 

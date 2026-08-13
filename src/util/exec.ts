@@ -7,7 +7,12 @@
  * The `Exec` interface is the injection seam for all of it: adapters resolve
  * `ctx.exec ?? nodeExec`, so tests substitute fakes and never spawn processes.
  */
-import { type ChildProcess, spawn } from 'node:child_process';
+import {
+  type ChildProcess,
+  type SpawnOptions as NodeSpawnOptions,
+  spawn,
+} from 'node:child_process';
+import { win32 as win32Path } from 'node:path';
 
 /** Cap captured output so a runaway child cannot exhaust memory. */
 const MAX_CAPTURE_BYTES = 2 * 1024 * 1024;
@@ -33,18 +38,73 @@ export interface ExecOptions extends SpawnOptions {
   timeoutMs: number;
 }
 
-/** Kill a child and, on POSIX, its entire process group. */
-export function killTree(child: ChildProcess): void {
+interface SpawnCommand {
+  args: string[];
+  command: string;
+}
+
+type ChildSpawn = (command: string, args: string[], options: NodeSpawnOptions) => ChildProcess;
+
+interface NodeExecDependencies {
+  execPath: string;
+  kill: typeof process.kill;
+  platform: NodeJS.Platform;
+  spawn: ChildSpawn;
+}
+
+const SYSTEM_DEPENDENCIES: NodeExecDependencies = {
+  execPath: process.execPath,
+  kill: process.kill,
+  platform: process.platform,
+  spawn: (command, args, options) => spawn(command, args, options),
+};
+
+/** Resolve the one known Windows command shim without routing arbitrary commands through a shell. */
+export function resolveSpawnCommand(
+  command: string,
+  args: string[],
+  platform = process.platform,
+  execPath = process.execPath,
+): SpawnCommand {
+  if (platform !== 'win32' || command !== 'npx') return { args, command };
+  return {
+    args: [
+      win32Path.join(win32Path.dirname(execPath), 'node_modules', 'npm', 'bin', 'npx-cli.js'),
+      ...args,
+    ],
+    command: execPath,
+  };
+}
+
+/** Kill a child and its platform-native process tree. */
+export function killTree(
+  child: ChildProcess,
+  overrides: Partial<Pick<NodeExecDependencies, 'kill' | 'platform' | 'spawn'>> = {},
+): void {
   if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) {
     return;
   }
-  if (process.platform !== 'win32') {
+  const dependencies = { ...SYSTEM_DEPENDENCIES, ...overrides };
+  if (dependencies.platform === 'win32') {
     try {
-      process.kill(-child.pid, 'SIGKILL');
-      return;
+      const taskkill = dependencies.spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], {
+        detached: false,
+        shell: false,
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+      taskkill.on('error', () => {});
+      taskkill.unref?.();
     } catch {
-      /* group may already be gone — fall through to direct kill */
+      /* best-effort teardown */
     }
+    return;
+  }
+  try {
+    dependencies.kill(-child.pid, 'SIGKILL');
+    return;
+  } catch {
+    /* group may already be gone — fall through to direct kill */
   }
   try {
     child.kill('SIGKILL');
@@ -53,26 +113,34 @@ export function killTree(child: ChildProcess): void {
   }
 }
 
-function spawnDetached(command: string, args: string[], opts: SpawnOptions): ChildProcess {
-  return spawn(command, args, {
+function spawnDetached(
+  command: string,
+  args: string[],
+  opts: SpawnOptions,
+  dependencies: NodeExecDependencies,
+): ChildProcess {
+  const resolved = resolveSpawnCommand(command, args, dependencies.platform, dependencies.execPath);
+  return dependencies.spawn(resolved.command, resolved.args, {
     ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
-    detached: process.platform !== 'win32',
+    detached: dependencies.platform !== 'win32',
     env: opts.inheritEnv === false ? (opts.env ?? {}) : { ...process.env, ...opts.env },
+    shell: false,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 }
 
-/** Run a command to completion, capturing bounded stdout/stderr, killing the tree on timeout. */
-export function execCapture(
+function execCaptureWith(
   command: string,
   args: string[],
   opts: ExecOptions,
+  dependencies: NodeExecDependencies,
 ): Promise<ExecResult> {
   return new Promise((resolve) => {
-    const child = spawnDetached(command, args, opts);
+    const child = spawnDetached(command, args, opts, dependencies);
     let stdout = '';
     let stderr = '';
     let timedOut = false;
+    let settled = false;
 
     child.stdout?.on('data', (chunk: Buffer) => {
       if (stdout.length < MAX_CAPTURE_BYTES) stdout += chunk.toString('utf8');
@@ -83,31 +151,31 @@ export function execCapture(
 
     const timer = setTimeout(() => {
       timedOut = true;
-      killTree(child);
+      killTree(child, dependencies);
     }, opts.timeoutMs);
+    const finish = (result: ExecResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
 
     child.on('error', (error) => {
-      clearTimeout(timer);
-      resolve({ code: null, signal: null, stderr: String(error), stdout, timedOut });
+      finish({ code: null, signal: null, stderr: String(error), stdout, timedOut });
     });
     child.on('close', (code, signal) => {
-      clearTimeout(timer);
-      resolve({ code, signal, stderr, stdout, timedOut });
+      finish({ code, signal, stderr, stdout, timedOut });
     });
   });
 }
 
-export interface ManagedProcess {
-  exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
-  hasExited: () => boolean;
-  kill: () => void;
-  stderrTail: () => string;
-  stdoutTail: () => string;
-}
-
-/** Spawn a long-running child with rolling output tails and group teardown. */
-export function spawnManaged(command: string, args: string[], opts: SpawnOptions): ManagedProcess {
-  const child = spawnDetached(command, args, opts);
+function spawnManagedWith(
+  command: string,
+  args: string[],
+  opts: SpawnOptions,
+  dependencies: NodeExecDependencies,
+): ManagedProcess {
+  const child = spawnDetached(command, args, opts, dependencies);
   let stdoutTail = '';
   let stderrTail = '';
   let exitedFlag = false;
@@ -120,23 +188,55 @@ export function spawnManaged(command: string, args: string[], opts: SpawnOptions
   });
 
   const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
-    child.on('error', () => {
+    let settled = false;
+    const finish = (code: number | null, signal: NodeJS.Signals | null) => {
       exitedFlag = true;
-      resolve({ code: null, signal: null });
-    });
-    child.on('close', (code, signal) => {
-      exitedFlag = true;
+      if (settled) return;
+      settled = true;
       resolve({ code, signal });
-    });
+    };
+    child.on('error', () => finish(null, null));
+    child.on('close', finish);
   });
 
   return {
     exited,
     hasExited: () => exitedFlag,
-    kill: () => killTree(child),
+    kill: () => killTree(child, dependencies),
     stderrTail: () => stderrTail,
     stdoutTail: () => stdoutTail,
   };
+}
+
+/** Build the real Exec seam or an isolated platform variant for process-level tests. */
+export function createNodeExec(overrides: Partial<NodeExecDependencies> = {}): Exec {
+  const dependencies = { ...SYSTEM_DEPENDENCIES, ...overrides };
+  return {
+    capture: (command, args, opts) => execCaptureWith(command, args, opts, dependencies),
+    spawn: (command, args, opts) => spawnManagedWith(command, args, opts, dependencies),
+  };
+}
+
+/** Run a command to completion, capturing bounded stdout/stderr, killing the tree on timeout. */
+export function execCapture(
+  command: string,
+  args: string[],
+  opts: ExecOptions,
+): Promise<ExecResult> {
+  return execCaptureWith(command, args, opts, SYSTEM_DEPENDENCIES);
+}
+
+export interface ManagedProcess {
+  exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+  hasExited: () => boolean;
+  kill: () => void;
+  stderrTail: () => string;
+  stdoutTail: () => string;
+}
+
+/** Spawn a long-running child with rolling output tails and group teardown. */
+export function spawnManaged(command: string, args: string[], opts: SpawnOptions): ManagedProcess {
+  return spawnManagedWith(command, args, opts, SYSTEM_DEPENDENCIES);
 }
 
 /**
@@ -150,7 +250,7 @@ export interface Exec {
 }
 
 /** Real child processes — the default for every adapter run. */
-export const nodeExec: Exec = { capture: execCapture, spawn: spawnManaged };
+export const nodeExec: Exec = createNodeExec();
 
 const BOX_DRAWING_ONLY = /^[\s\u2500-\u257f]+$/u;
 const ERROR_SHAPED =

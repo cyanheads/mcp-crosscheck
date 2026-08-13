@@ -1,0 +1,79 @@
+name: Adapter request
+description: Propose a deterministic MCP client capture adapter
+title: "feat(adapter): "
+labels:
+  - adapter
+assignees:
+  - cyanheads
+body:
+  - type: markdown
+    attributes:
+      value: |
+        An adapter must expose the client's rendered MCP surface without an account, tokens, model inference, or non-loopback provider traffic. Clients that require model traffic to reveal the surface are out of scope.
+  - type: input
+    id: client
+    attributes:
+      label: Client
+      placeholder: Client name
+    validations:
+      required: true
+  - type: input
+    id: release_source
+    attributes:
+      label: Official release source
+      description: Link to the package, release page, or official download that provides versioned builds.
+      placeholder: https://github.com/owner/client/releases
+    validations:
+      required: true
+  - type: dropdown
+    id: transports
+    attributes:
+      label: Target transports
+      multiple: true
+      options:
+        - stdio
+        - streamable HTTP
+    validations:
+      required: true
+  - type: textarea
+    id: rendered_surface
+    attributes:
+      label: Rendered MCP surface
+      description: Describe the function, OpenAPI, or other declaration shape the adapter would capture.
+    validations:
+      required: true
+  - type: textarea
+    id: version_resolution
+    attributes:
+      label: Version resolution
+      description: Show how the exact installed or package-backed client version is resolved and reported.
+    validations:
+      required: true
+  - type: textarea
+    id: capture_path
+    attributes:
+      label: Deterministic capture path
+      description: Document the exact local mechanism that exposes the rendered MCP declarations without model traffic.
+    validations:
+      required: true
+  - type: textarea
+    id: prerequisites
+    attributes:
+      label: Local prerequisites
+      description: List required executables, packages, environment isolation, and loopback services.
+    validations:
+      required: true
+  - type: textarea
+    id: limitations
+    attributes:
+      label: Known limitations
+      description: Note unsupported transports, schemas, operating systems, or capture boundaries.
+    validations:
+      required: true
+  - type: checkboxes
+    id: deterministic_boundary
+    attributes:
+      label: Capture boundary
+      options:
+        - label: The proposed capture needs no account, tokens, model inference, or non-loopback provider traffic.
+          required: true
