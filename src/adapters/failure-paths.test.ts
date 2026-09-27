@@ -5,7 +5,8 @@
  * pins: `adapter-broken` (the client itself failed to launch),
  * `handshake-failure` (the client ran but could not read the server), or a
  * clean capture. Only child-process spawning is faked — the codex intercept
- * server and mcpo's readiness polling stay real.
+ * server and mcpo's readiness polling stay real — except where a test needs the
+ * runtime's own spawn error for a command that is not on PATH.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
@@ -15,7 +16,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRedactor } from '../redact.js';
 import type { AdapterContext } from '../types.js';
-import type { Exec, ExecResult, ManagedProcess, SpawnOptions } from '../util/exec.js';
+import {
+  type Exec,
+  type ExecResult,
+  type ManagedProcess,
+  nodeExec,
+  type SpawnOptions,
+} from '../util/exec.js';
 import { claudeCodeAdapter } from './claude-code.js';
 import { codexAdapter } from './codex.js';
 import { inspectorAdapter } from './inspector.js';
@@ -729,14 +736,51 @@ describe('claude-code', () => {
       context(
         claudeCodeExec(
           () => {
-            throw new Error('a missing executable must not spawn');
+            throw new Error('a broken executable must not spawn');
           },
-          { code: null, stderr: 'spawn claude ENOENT' },
+          { code: 1, stderr: 'claude: unsupported platform' },
         ),
       ),
     );
     expect(result.status).toBe('adapter-broken');
-    expect(result.statusDetail).toContain('spawn claude ENOENT');
+    expect(result.statusDetail).toBe(
+      'installed Claude Code is unavailable — claude: unsupported platform',
+    );
+  });
+
+  test('adapter-broken: no claude on PATH names the executable the adapter needs', async () => {
+    // Real spawning, with a PATH that holds no claude, so the runtime's own ENOENT is what classifies.
+    const noClaudeOnPath: Exec = {
+      capture: (command, args, opts) =>
+        nodeExec.capture(command, args, { ...opts, env: { PATH: workDir }, inheritEnv: false }),
+      spawn: () => {
+        throw new Error('a missing executable must not spawn');
+      },
+    };
+    const result = await claudeCodeAdapter.run(context(noClaudeOnPath));
+    expect(result.status).toBe('adapter-broken');
+    expect(result.resolvedVersion).toBeNull();
+    expect(result.statusDetail).toStartWith(
+      'installed Claude Code is unavailable — the claude-code adapter needs a claude executable on PATH',
+    );
+    expect(result.statusDetail).toContain('an npm global install provides only claude.cmd');
+  });
+
+  test('adapter-broken: a claude that fails to start for another reason keeps the spawn error', async () => {
+    const result = await claudeCodeAdapter.run(
+      context(
+        claudeCodeExec(
+          () => {
+            throw new Error('an unlaunchable executable must not spawn');
+          },
+          { code: null, spawnErrorCode: 'EACCES', stderr: 'Error: spawn claude EACCES' },
+        ),
+      ),
+    );
+    expect(result.status).toBe('adapter-broken');
+    expect(result.statusDetail).toBe(
+      'installed Claude Code is unavailable — Error: spawn claude EACCES',
+    );
   });
 
   test('adapter-broken: claude exited before issuing a tools-bearing request', async () => {

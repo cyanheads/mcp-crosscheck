@@ -1,8 +1,10 @@
 /**
  * @file src/util/exec.test.ts
  * Tests for the process helpers: output compression (findings and status
- * details must stay one bounded line, whatever a child prints) and the timeout
- * path that feeds `handshake-failure` classification.
+ * details must stay one bounded line, whatever a child prints), the timeout
+ * path that feeds `handshake-failure` classification, process-group teardown
+ * of descendants that outlive their leader, and UTF-8 decoding across pipe
+ * chunks. Windows paths run through the platform-parameterized seam only.
  */
 import { describe, expect, test } from 'bun:test';
 import type { ChildProcess, SpawnOptions as NodeSpawnOptions } from 'node:child_process';
@@ -16,7 +18,9 @@ import {
   killTree,
   nodeExec,
   resolveSpawnCommand,
+  spawnManaged,
 } from './exec.js';
+import { npmLatestVersion } from './versions.js';
 
 /** The shape mcpo fails with when a fresh `uvx` resolve pulls an incompatible dependency. */
 const PYTHON_TRACEBACK = [
@@ -213,6 +217,203 @@ describe('execCapture', () => {
     expect(result.timedOut).toBe(true);
     expect(result.code).not.toBe(0);
   });
+
+  test('reports the errno of a command that never started', async () => {
+    const result = await execCapture('crosscheck-no-such-command', [], {
+      env: { PATH: import.meta.dir },
+      inheritEnv: false,
+      timeoutMs: 30_000,
+    });
+    expect(result.spawnErrorCode).toBe('ENOENT');
+    expect(result.code).toBeNull();
+    expect(result.timedOut).toBe(false);
+  });
+});
+
+/** Every character here is multibyte in UTF-8 except the ASCII ones, and the emoji is a surrogate pair. */
+const MULTIBYTE = 'café — 😀 ✓';
+
+/** A child that writes `MULTIBYTE` to stdout and stderr one byte per write, so every character straddles reads. */
+const BYTE_AT_A_TIME = `
+const bytes = [...Buffer.from(${JSON.stringify(MULTIBYTE)}, 'utf8')];
+let index = 0;
+const timer = setInterval(() => {
+  const byte = Buffer.from([bytes[index]]);
+  process.stdout.write(byte);
+  process.stderr.write(byte);
+  index += 1;
+  if (index === bytes.length) clearInterval(timer);
+}, 5);
+`;
+
+describe('UTF-8 output across pipe chunks', () => {
+  test('capture decodes characters split across reads', async () => {
+    const result = await execCapture(process.execPath, ['-e', BYTE_AT_A_TIME], {
+      timeoutMs: 30_000,
+    });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toBe(MULTIBYTE);
+    expect(result.stderr).toBe(MULTIBYTE);
+  });
+
+  test('managed tails decode characters split across reads', async () => {
+    const managed = spawnManaged(process.execPath, ['-e', BYTE_AT_A_TIME], {});
+    expect((await managed.exited).code).toBe(0);
+    expect(managed.stdoutTail()).toBe(MULTIBYTE);
+    expect(managed.stderrTail()).toBe(MULTIBYTE);
+  });
+
+  test('a managed tail never opens on the second half of a surrogate pair', async () => {
+    const child = fakeChild(1357);
+    const managed = createNodeExec({
+      kill: () => true,
+      platform: 'linux',
+      spawn: () => child,
+    }).spawn('client', [], {});
+    // 32,768 emoji plus one ASCII unit is 65,537 UTF-16 units: a 64 KiB cut lands mid-pair.
+    exitAfterWriting(child, 'stderr', Buffer.from(`${'😀'.repeat(32_768)}!`, 'utf8'));
+    await managed.exited;
+
+    const tail = managed.stderrTail();
+    expect(tail.length).toBe(64 * 1024 - 1);
+    expect(tail.codePointAt(0)).toBe(0x1f600);
+    expect(tail.endsWith('😀!')).toBe(true);
+  });
+});
+
+/** Whether `pid` still names a live process; zombies count until their new parent reaps them. */
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Poll until `pid` is gone, allowing time for the orphan's new parent to reap it. */
+async function diesWithin(pid: number, ms: number): Promise<boolean> {
+  const deadline = Date.now() + ms;
+  while (isAlive(pid)) {
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return true;
+}
+
+/**
+ * A leader that starts one grandchild sharing its stdio and prints the
+ * grandchild's PID. The grandchild lives 30s on its own, so a teardown that
+ * misses it cannot leak it for longer. `detached` moves the grandchild out of
+ * the leader's process group; `leaderIdles` keeps the leader running too.
+ */
+function leaderScript(opts: { detached?: boolean; leaderIdles?: boolean } = {}): string {
+  return `
+const { spawn } = require('node:child_process');
+const grandchild = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], {
+  detached: ${opts.detached === true},
+  stdio: 'inherit',
+});
+grandchild.unref();
+process.stdout.write(grandchild.pid + '\\n');
+${opts.leaderIdles === true ? 'setInterval(() => {}, 1000);' : ''}
+`;
+}
+
+/** The grandchild PID the leader printed, killed by exact PID if a test fails before it dies. */
+async function withGrandchild(
+  stdout: () => string,
+  body: (pid: number) => Promise<void>,
+): Promise<void> {
+  let pid: number | null = null;
+  try {
+    const printed = Number.parseInt(stdout(), 10);
+    expect(Number.isSafeInteger(printed)).toBe(true);
+    pid = printed;
+    await body(printed);
+  } finally {
+    if (pid !== null && isAlive(pid)) process.kill(pid, 'SIGKILL');
+  }
+}
+
+describe.skipIf(process.platform === 'win32')('POSIX process-group teardown', () => {
+  test(
+    'a timeout kills every member of the group, not only the leader',
+    async () => {
+      const result = await execCapture(
+        process.execPath,
+        ['-e', leaderScript({ leaderIdles: true })],
+        { timeoutMs: 1_000 },
+      );
+      await withGrandchild(
+        () => result.stdout,
+        async (pid) => {
+          expect(result.timedOut).toBe(true);
+          expect(await diesWithin(pid, 2_000)).toBe(true);
+        },
+      );
+    },
+    { timeout: 20_000 },
+  );
+
+  test(
+    'capture returns when the leader exits and kills the descendant holding its pipes',
+    async () => {
+      const started = Date.now();
+      const result = await execCapture(process.execPath, ['-e', leaderScript()], {
+        timeoutMs: 10_000,
+      });
+      const elapsed = Date.now() - started;
+      await withGrandchild(
+        () => result.stdout,
+        async (pid) => {
+          expect(result).toMatchObject({ code: 0, signal: null, timedOut: false });
+          expect(elapsed).toBeLessThan(5_000);
+          expect(await diesWithin(pid, 2_000)).toBe(true);
+        },
+      );
+    },
+    { timeout: 20_000 },
+  );
+
+  test(
+    'a managed leader exit settles exited and kills the descendant holding its pipes',
+    async () => {
+      const started = Date.now();
+      const managed = spawnManaged(process.execPath, ['-e', leaderScript()], {});
+      const exit = await managed.exited;
+      const elapsed = Date.now() - started;
+      await withGrandchild(managed.stdoutTail, async (pid) => {
+        expect(exit).toEqual({ code: 0, signal: null });
+        expect(managed.hasExited()).toBe(true);
+        expect(elapsed).toBeLessThan(5_000);
+        expect(await diesWithin(pid, 2_000)).toBe(true);
+        expect(() => managed.kill()).not.toThrow();
+      });
+    },
+    { timeout: 20_000 },
+  );
+
+  test(
+    'capture cuts the pipes of a descendant that left the group, within the drain grace',
+    async () => {
+      const started = Date.now();
+      const result = await execCapture(process.execPath, ['-e', leaderScript({ detached: true })], {
+        timeoutMs: 10_000,
+      });
+      const elapsed = Date.now() - started;
+      await withGrandchild(
+        () => result.stdout,
+        async (pid) => {
+          expect(result).toMatchObject({ code: 0, signal: null, timedOut: false });
+          expect(elapsed).toBeLessThan(5_000);
+          // Outside the group, the grandchild is beyond teardown's reach; withGrandchild kills it.
+          expect(isAlive(pid)).toBe(true);
+        },
+      );
+    },
+    { timeout: 20_000 },
+  );
 });
 
 interface FakeChild extends ChildProcess {
@@ -231,6 +432,19 @@ function fakeChild(pid: number | undefined): FakeChild {
   }) as unknown as FakeChild;
 }
 
+/** Write `data` to one fake pipe, exit 0, and close once the consumer has read to the end. */
+function exitAfterWriting(
+  child: FakeChild,
+  stream: 'stderr' | 'stdout',
+  data: string | Buffer,
+): void {
+  const pipe = child[stream] as PassThrough;
+  pipe.once('end', () => child.emit('close', 0, null));
+  pipe.end(data);
+  child.exitCode = 0;
+  child.emit('exit', 0, null);
+}
+
 describe('platform command construction', () => {
   const TOKENS = [
     'space value',
@@ -245,7 +459,7 @@ describe('platform command construction', () => {
   ];
 
   test('preserves every POSIX command and token unchanged', () => {
-    for (const command of ['npx', 'uvx', 'node', 'claude', './user-server']) {
+    for (const command of ['npx', 'npm', 'uvx', 'node', 'claude', './user-server']) {
       expect(resolveSpawnCommand(command, TOKENS, 'linux', '/usr/bin/node')).toEqual({
         args: TOKENS,
         command,
@@ -253,19 +467,63 @@ describe('platform command construction', () => {
     }
   });
 
-  test('runs only bare Windows npx through Node while preserving metacharacter tokens', () => {
-    expect(
-      resolveSpawnCommand('npx', TOKENS, 'win32', 'C:\\Program Files\\nodejs\\node.exe'),
-    ).toEqual({
-      args: ['C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npx-cli.js', ...TOKENS],
-      command: 'C:\\Program Files\\nodejs\\node.exe',
+  test('runs only bare Windows npx and npm through Node while preserving metacharacter tokens', () => {
+    const node = 'C:\\Program Files\\nodejs\\node.exe';
+    for (const [command, cli] of [
+      ['npx', 'npx-cli.js'],
+      ['npm', 'npm-cli.js'],
+    ] as const) {
+      expect(resolveSpawnCommand(command, TOKENS, 'win32', node)).toEqual({
+        args: [`C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\${cli}`, ...TOKENS],
+        command: node,
+      });
+    }
+
+    for (const command of [
+      'npx.cmd',
+      'npm.cmd',
+      'uvx',
+      'bun',
+      'node',
+      'claude',
+      'constructor',
+      '.\\user-server.cmd',
+    ]) {
+      expect(resolveSpawnCommand(command, TOKENS, 'win32', node)).toEqual({
+        args: TOKENS,
+        command,
+      });
+    }
+  });
+
+  test('npmLatestVersion reaches npm through Node on Windows', async () => {
+    const calls: { args: string[]; command: string; options: NodeSpawnOptions }[] = [];
+    const npm = fakeChild(1122);
+    const exec = createNodeExec({
+      execPath: 'C:\\Program Files\\nodejs\\node.exe',
+      platform: 'win32',
+      spawn: (command, args, options) => {
+        calls.push({ args, command, options });
+        queueMicrotask(() => exitAfterWriting(npm, 'stdout', '2.1.0\n'));
+        return npm;
+      },
     });
 
-    for (const command of ['npx.cmd', 'uvx', 'bun', 'node', 'claude', '.\\user-server.cmd']) {
-      expect(
-        resolveSpawnCommand(command, TOKENS, 'win32', 'C:\\Program Files\\nodejs\\node.exe'),
-      ).toEqual({ args: TOKENS, command });
-    }
+    expect(await npmLatestVersion('@modelcontextprotocol/inspector', 'C:\\work', exec)).toBe(
+      '2.1.0',
+    );
+    expect(calls).toEqual([
+      {
+        args: [
+          'C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npm-cli.js',
+          'view',
+          '@modelcontextprotocol/inspector',
+          'version',
+        ],
+        command: 'C:\\Program Files\\nodejs\\node.exe',
+        options: expect.objectContaining({ cwd: 'C:\\work', detached: false, shell: false }),
+      },
+    ]);
   });
 });
 
@@ -383,4 +641,86 @@ describe('platform process-tree teardown', () => {
       }),
     ).not.toThrow();
   });
+
+  test('a POSIX leader exit sweeps its group once, and a later kill signals nothing', async () => {
+    const signals: [number, NodeJS.Signals][] = [];
+    const leader = fakeChild(4321);
+    const managed = createNodeExec({
+      kill: ((pid: number, signal: NodeJS.Signals) => {
+        signals.push([pid, signal]);
+        return true;
+      }) as typeof process.kill,
+      platform: 'linux',
+      spawn: () => leader,
+    }).spawn('npx', ['client'], {});
+
+    exitAfterWriting(leader, 'stderr', 'client output');
+    expect(signals).toEqual([[-4321, 'SIGKILL']]);
+    await managed.exited;
+    managed.kill();
+    expect(signals).toEqual([[-4321, 'SIGKILL']]);
+    expect(managed.stderrTail()).toBe('client output');
+  });
+
+  /** A leader that exits while its pipes stay open, as when an unreachable descendant holds them. */
+  function pipesOutliveLeader(platform: NodeJS.Platform) {
+    const signals: number[] = [];
+    const spawned: string[] = [];
+    const leader = fakeChild(5555);
+    const exec = createNodeExec({
+      execPath: 'C:\\Program Files\\nodejs\\node.exe',
+      kill: ((pid: number) => {
+        signals.push(pid);
+        return true;
+      }) as typeof process.kill,
+      platform,
+      spawn: (command) => {
+        spawned.push(command);
+        return leader;
+      },
+    });
+    const exitLeavingPipesOpen = () => {
+      (leader.stdout as PassThrough).write('partial output');
+      leader.exitCode = 0;
+      leader.emit('exit', 0, null);
+    };
+    return { exec, exitLeavingPipesOpen, leader, signals, spawned };
+  }
+
+  for (const platform of ['linux', 'win32'] as const) {
+    test(`${platform}: capture cuts pipes that outlive the leader after the drain grace`, async () => {
+      const harness = pipesOutliveLeader(platform);
+      const started = Date.now();
+      const pending = harness.exec.capture('client', [], { timeoutMs: 50 });
+      harness.exitLeavingPipesOpen();
+      const result = await pending;
+
+      // The leader exited inside its budget, so the drain wait is not a timeout.
+      expect(result).toEqual({
+        code: 0,
+        signal: null,
+        stderr: '',
+        stdout: 'partial output',
+        timedOut: false,
+      });
+      expect(Date.now() - started).toBeGreaterThanOrEqual(900);
+      expect(harness.leader.stdout?.destroyed).toBe(true);
+      expect(harness.leader.stderr?.destroyed).toBe(true);
+      expect(harness.spawned).toEqual(['client']);
+      expect(harness.signals).toEqual(platform === 'win32' ? [] : [-5555]);
+    });
+
+    test(`${platform}: managed exited settles after the drain grace and a later kill is inert`, async () => {
+      const harness = pipesOutliveLeader(platform);
+      const managed = harness.exec.spawn('client', [], {});
+      harness.exitLeavingPipesOpen();
+
+      expect(await managed.exited).toEqual({ code: 0, signal: null });
+      expect(managed.hasExited()).toBe(true);
+      expect(managed.stdoutTail()).toBe('partial output');
+      managed.kill();
+      expect(harness.spawned).toEqual(['client']);
+      expect(harness.signals).toEqual(platform === 'win32' ? [] : [-5555]);
+    });
+  }
 });

@@ -12,7 +12,7 @@ import { join } from 'node:path';
 
 import { z } from 'zod';
 
-import { renderedToolFromJsonSchema } from '../schema.js';
+import { isRecord, renderedToolFromJsonSchema } from '../schema.js';
 import type {
   Adapter,
   AdapterContext,
@@ -69,7 +69,6 @@ interface CaptureServer {
 /** Loopback Anthropic stub; resolves on the first request carrying a non-empty tools array. */
 function startCaptureServer(port: number): Promise<CaptureServer> {
   let resolveCaptured: (body: unknown) => void;
-  let didCapture = false;
   const captured = new Promise<unknown>((resolve) => {
     resolveCaptured = resolve;
   });
@@ -84,15 +83,7 @@ function startCaptureServer(port: number): Promise<CaptureServer> {
     request.on('end', () => {
       try {
         const body: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-        if (
-          !didCapture &&
-          typeof body === 'object' &&
-          body !== null &&
-          'tools' in body &&
-          Array.isArray(body.tools) &&
-          body.tools.length > 0
-        ) {
-          didCapture = true;
+        if (isRecord(body) && Array.isArray(body.tools) && body.tools.length > 0) {
           resolveCaptured(body);
         }
       } catch {
@@ -146,6 +137,12 @@ async function installedVersion(
     cwd: ctx.workDir,
     timeoutMs: Math.min(ctx.timeoutMs, 30_000),
   });
+  if (result.spawnErrorCode === 'ENOENT') {
+    return {
+      error: `the claude-code adapter needs a claude executable on PATH; on Windows an npm global install provides only claude.cmd, which cannot launch without a shell, so use the native installer's claude.exe (${excerpt(result.stderr)})`,
+      version: null,
+    };
+  }
   const version = `${result.stdout}\n${result.stderr}`.match(/\d+\.\d+\.\d+[^\s]*/)?.[0] ?? null;
   if (result.code === 0 && !result.timedOut && version !== null) {
     return { error: null, version };

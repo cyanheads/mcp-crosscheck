@@ -199,17 +199,22 @@ async function run(ctx: AdapterContext): Promise<AdapterRunResult> {
   await writeFile(join(codexHome, 'config.toml'), buildConfigToml(target, port));
   ctx.log(`codex: resolved ${resolvedVersion ?? 'unknown version'}, intercept on :${port}`);
 
-  const path = process.env.PATH;
-  if (path === undefined || path === '') {
-    return {
+  const finish = (partial: Omit<AdapterRunResult, 'adapter' | 'durationMs' | 'resolvedVersion'>) =>
+    ({
       adapter: 'codex',
-      canary: null,
       durationMs: Date.now() - startedAt,
       resolvedVersion,
+      ...partial,
+    }) satisfies AdapterRunResult;
+
+  const path = process.env.PATH;
+  if (path === undefined || path === '') {
+    return finish({
+      canary: null,
       status: 'adapter-broken',
       statusDetail: 'PATH is required to launch the codex package runner',
       surface: null,
-    };
+    });
   }
   const headerEnvironment =
     target.kind === 'http'
@@ -236,16 +241,6 @@ async function run(ctx: AdapterContext): Promise<AdapterRunResult> {
       inheritEnv: false,
     },
   );
-
-  const finish = (partial: Omit<AdapterRunResult, 'adapter' | 'durationMs' | 'resolvedVersion'>) =>
-    ({
-      adapter: 'codex',
-      durationMs: Date.now() - startedAt,
-      resolvedVersion,
-      ...partial,
-    }) satisfies AdapterRunResult;
-
-  const capturedOnly = { attempted: false, detail: 'codex adapter is capture-only', ok: null };
 
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<{ kind: 'timeout' }>((resolve) => {
@@ -292,7 +287,12 @@ async function run(ctx: AdapterContext): Promise<AdapterRunResult> {
         surface: null,
       });
     }
-    return finish({ canary: capturedOnly, status: 'ok', statusDetail: null, surface });
+    return finish({
+      canary: { attempted: false, detail: 'codex adapter is capture-only', ok: null },
+      status: 'ok',
+      statusDetail: null,
+      surface,
+    });
   } finally {
     clearTimeout(timer);
     proc.kill();
