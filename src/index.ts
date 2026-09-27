@@ -22,7 +22,12 @@ export {
   runGroundTruthCanary,
   terminateGroundTruthSession,
 } from './ground-truth.js';
-export { buildFindings, compareSurface } from './invariants.js';
+export {
+  buildFindings,
+  compareSurface,
+  depthLimitedPaths,
+  groundTruthFindings,
+} from './invariants.js';
 export { renderHumanReport, toJsonReport } from './report.js';
 export type { CrosscheckOptions } from './run.js';
 export { CrosscheckUsageError, runCrosscheck } from './run.js';

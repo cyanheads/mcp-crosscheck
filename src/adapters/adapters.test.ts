@@ -14,7 +14,7 @@ import { compareSurface } from '../invariants.js';
 import type { GroundTruth, GroundTruthTool } from '../types.js';
 import { surfaceFromClaudeCodeBody } from './claude-code.js';
 import { surfaceFromCodexBody } from './codex.js';
-import { ADAPTERS, DEFAULT_ADAPTERS } from './index.js';
+import { ADAPTERS, DEFAULT_ADAPTERS, isAdapterName } from './index.js';
 import { surfaceFromOpenApiDoc } from './mcpo.js';
 
 const FIXTURES = join(import.meta.dir, '..', '..', 'tests', 'fixtures');
@@ -46,6 +46,21 @@ test('claude-code is registered as opt-in without changing hermetic defaults', (
   expect(DEFAULT_ADAPTERS).toEqual(['inspector', 'mcpo']);
 });
 
+describe('isAdapterName', () => {
+  test('accepts exactly the four registered adapter names', () => {
+    for (const name of ['claude-code', 'codex', 'inspector', 'mcpo']) {
+      expect(isAdapterName(name)).toBe(true);
+    }
+  });
+
+  test('rejects every inherited Object.prototype key and unknown names', () => {
+    const inherited = Object.getOwnPropertyNames(Object.prototype);
+    expect(inherited).toContain('__proto__');
+    expect(inherited).toContain('constructor');
+    expect([...inherited, 'nope', ''].filter((name) => isAdapterName(name))).toEqual([]);
+  });
+});
+
 describe('surfaceFromClaudeCodeBody', () => {
   const fixture = loadFixture('claude-code-request.json');
   const surface = surfaceFromClaudeCodeBody(fixture, 'fixture');
@@ -68,10 +83,23 @@ describe('surfaceFromClaudeCodeBody', () => {
     expect(timeout?.constraints.minimum).toBe(1);
   });
 
-  test('records only the observed root-union flattening', () => {
+  test('records only the observed root-union flattening and its replaced descriptions', () => {
     const findings = compareSurface(FIXTURE_GROUND_TRUTH, surface ?? { tools: [] });
+    const rewritten = { change: 'rewritten', kind: 'description-altered', subject: 'tool' };
     expect(findings).toEqual([
+      expect.objectContaining({
+        evidence: rewritten,
+        path: 'union_modes',
+        rule: 'description-altered',
+        severity: 'info',
+      }),
       expect.objectContaining({ path: 'union_modes', rule: 'anyof-ignored', severity: 'info' }),
+      expect.objectContaining({
+        evidence: rewritten,
+        path: 'branch_only_fields',
+        rule: 'description-altered',
+        severity: 'info',
+      }),
       expect.objectContaining({
         path: 'branch_only_fields',
         rule: 'anyof-ignored',
@@ -182,6 +210,7 @@ describe('surfaceFromOpenApiDoc', () => {
     const findings = compareSurface(groundTruth.tools, surface ?? { tools: [] });
     expect(findings.filter((finding) => finding.severity === 'fail')).toEqual([]);
     expect(findings.some((finding) => finding.detail.includes('enum'))).toBe(true);
+    expect(findings.every((finding) => finding.rule === 'constraint-dropped')).toBe(true);
   });
 
   test('the anyOf response envelope becomes the rendered result model', () => {

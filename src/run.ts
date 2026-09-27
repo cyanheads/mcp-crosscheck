@@ -7,18 +7,20 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
-import { ADAPTERS } from './adapters/index.js';
+import { ADAPTERS, isAdapterName } from './adapters/index.js';
 import {
   BaselineValidationError,
   parseBaseline,
+  RUNTIME_RULES,
   reconcileBaseline,
   updateBaseline,
   writeBaselineAtomic,
 } from './baseline.js';
 import { validateHttpHeaders } from './cli-args.js';
 import { captureGroundTruth, runGroundTruthCanary } from './ground-truth.js';
-import { buildFindings } from './invariants.js';
-import { createRedactor, redactValue, registerReportRedactor } from './redact.js';
+import { buildFindings, depthLimitedPaths, groundTruthFindings } from './invariants.js';
+import { createRedactor, redactRunReport, registerReportRedactor } from './redact.js';
+import { truncationNote } from './report.js';
 import { canonicalizeTarget } from './target.js';
 import type {
   AdapterName,
@@ -31,10 +33,20 @@ import type {
 import type { Exec } from './util/exec.js';
 import { VERSION } from './version.js';
 
-/** Raised for caller mistakes (bad flags, bad canary spec) — CLI exit code 2. */
+/**
+ * Raised for caller mistakes (bad flags, bad canary spec) and for a canary
+ * that fails its ground-truth preflight, whichever side is at fault — CLI exit code 2.
+ */
 export class CrosscheckUsageError extends Error {}
 
+/**
+ * Longest delay a Node timer honors. A longer one fires after 1 ms with a
+ * TimeoutOverflowWarning, which would time out every stage at once.
+ */
+export const MAX_TIMEOUT_MS = 2_147_483_647;
+
 export interface CrosscheckOptions {
+  /** Adapters to run, in this order; each name at most once. */
   adapters: AdapterName[];
   /** Directory to persist raw captures into; created if missing. */
   artifactsDir?: string | null;
@@ -49,7 +61,7 @@ export interface CrosscheckOptions {
   /** Adapter name → exact version, overriding the latest-floats default. */
   pins?: Partial<Record<AdapterName, string>>;
   target: TargetSpec;
-  /** Per-stage timeout in milliseconds. */
+  /** Per-stage timeout in milliseconds, from 1 to `MAX_TIMEOUT_MS`. Default: 120000. */
   timeoutMs?: number;
   updateBaseline?: boolean;
 }
@@ -62,23 +74,59 @@ const GENERATED_ARTIFACT_NAMES = [
   'report.json',
 ] as const;
 
-/** Run the full crosscheck: ground truth, canary preflight, every selected adapter. */
-export async function runCrosscheck(options: CrosscheckOptions): Promise<RunReport> {
-  const canonicalTarget = canonicalizeTarget(options.target, process.cwd());
-  let target: TargetSpec;
+/** Reject an unknown, inherited, or repeated adapter name, and a pin naming no adapter. */
+function assertAdapterSelection(adapters: readonly string[], pins: object): void {
+  const selected = new Set<string>();
+  for (const name of adapters) {
+    if (!isAdapterName(name)) {
+      throw new CrosscheckUsageError(
+        `unknown adapter "${name}" — known adapters: inspector, mcpo, codex, claude-code`,
+      );
+    }
+    if (selected.has(name)) {
+      throw new CrosscheckUsageError(`adapter "${name}" is selected more than once`);
+    }
+    selected.add(name);
+  }
+  for (const name of Object.keys(pins)) {
+    if (!isAdapterName(name)) {
+      throw new CrosscheckUsageError(`pins names unknown adapter "${name}"`);
+    }
+  }
+}
+
+/** Canonicalize the target, then check an HTTP target's header map and URL scheme. */
+function validatedTarget(spec: TargetSpec): TargetSpec {
+  const target = canonicalizeTarget(spec, process.cwd(), process.platform);
+  if (target.kind === 'stdio') return target;
+  let headers: Record<string, string>;
   try {
-    target =
-      canonicalTarget.kind === 'http'
-        ? {
-            headers: validateHttpHeaders(canonicalTarget.headers ?? {}),
-            kind: 'http',
-            url: canonicalTarget.url,
-          }
-        : canonicalTarget;
+    headers = validateHttpHeaders(target.headers ?? {});
   } catch (error) {
     throw new CrosscheckUsageError(error instanceof Error ? error.message : String(error));
   }
+  const { url } = target;
+  if (!URL.canParse(url) || !['http:', 'https:'].includes(new URL(url).protocol)) {
+    const redact = createRedactor(Object.values(headers));
+    throw new CrosscheckUsageError(
+      redact(`target URL must be an http: or https: URL, got: ${url}`),
+    );
+  }
+  return { headers, kind: 'http', url };
+}
+
+/** Run the full crosscheck: ground truth, canary preflight, every selected adapter. */
+export async function runCrosscheck(options: CrosscheckOptions): Promise<RunReport> {
+  // Caller mistakes that need no I/O are rejected first, before any file or process is touched.
+  assertAdapterSelection(options.adapters, options.pins ?? {});
   const timeoutMs = options.timeoutMs ?? 120_000;
+  // Node's own timer bound; the negated form also rejects NaN.
+  if (!(timeoutMs >= 1 && timeoutMs <= MAX_TIMEOUT_MS)) {
+    throw new CrosscheckUsageError(
+      `timeoutMs must be from 1 to ${MAX_TIMEOUT_MS} milliseconds, got: ${timeoutMs}`,
+    );
+  }
+  const target = validatedTarget(options.target);
   const canary = options.canary ?? null;
   const artifactsDir =
     options.artifactsDir === undefined || options.artifactsDir === null
@@ -101,6 +149,12 @@ export async function runCrosscheck(options: CrosscheckOptions): Promise<RunRepo
       `baseline path must not alias the generated ${aliasedArtifactName} artifact`,
     );
   }
+  for (const name of options.adapters) {
+    const verdict = ADAPTERS[name].supports(target);
+    if (verdict !== true) {
+      throw new CrosscheckUsageError(`adapter "${name}": ${verdict}`);
+    }
+  }
   const redact = createRedactor(target.kind === 'http' ? Object.values(target.headers ?? {}) : []);
   const writeLog = options.log ?? (() => {});
   const log = (line: string) => writeLog(redact(line));
@@ -122,23 +176,19 @@ export async function runCrosscheck(options: CrosscheckOptions): Promise<RunRepo
     }
   }
 
-  for (const name of options.adapters) {
-    const verdict = ADAPTERS[name].supports(target);
-    if (verdict !== true) {
-      throw new CrosscheckUsageError(`adapter "${name}": ${verdict}`);
-    }
-  }
-
+  // Everything after the scratch directory exists runs inside the boundary that removes it.
   const workDir = await mkdtemp(join(tmpdir(), 'mcp-crosscheck-'));
-  if (artifactsDir !== null) {
-    await mkdir(artifactsDir, { recursive: true });
-  }
-
   try {
+    if (artifactsDir !== null) {
+      await mkdir(artifactsDir, { recursive: true });
+    }
     log('capturing ground truth via the official MCP SDK client');
     const groundTruth = await captureGroundTruth(target, timeoutMs);
+    const { truncation } = groundTruth;
     log(
-      `ground truth: ${groundTruth.serverName ?? 'unnamed server'} advertises ${groundTruth.tools.length} tool(s)`,
+      `ground truth: ${groundTruth.serverName ?? 'unnamed server'} advertises ${groundTruth.tools.length} tool(s)${
+        truncation === null ? '' : `; ${truncationNote(truncation)}`
+      }`,
     );
     if (artifactsDir !== null) {
       await writeFile(
@@ -151,17 +201,16 @@ export async function runCrosscheck(options: CrosscheckOptions): Promise<RunRepo
     if (canary !== null) {
       if (!groundTruth.tools.some((tool) => tool.name === canary.tool)) {
         throw new CrosscheckUsageError(
-          `canary tool "${canary.tool}" is not advertised by the server`,
+          truncation === null
+            ? `canary tool "${canary.tool}" is not advertised by the server`
+            : `canary tool "${canary.tool}" was not found in the ${truncation.pagesRead} page(s) of tools/list read before the walk stopped (${truncation.reason})`,
         );
       }
-      groundTruthCanary = redactValue(
-        await runGroundTruthCanary(target, canary, timeoutMs),
-        redact,
-      );
+      groundTruthCanary = await runGroundTruthCanary(target, canary, timeoutMs);
       if (groundTruthCanary.ok !== true) {
         throw new CrosscheckUsageError(
-          `canary failed against ground truth — fix the canary spec before blaming a client${
-            groundTruthCanary.detail === null ? '' : ` (${groundTruthCanary.detail})`
+          `canary ${canary.tool} failed through the official MCP SDK client, before any adapter ran${
+            groundTruthCanary.detail === null ? '' : `: ${groundTruthCanary.detail}`
           }`,
         );
       }
@@ -183,17 +232,17 @@ export async function runCrosscheck(options: CrosscheckOptions): Promise<RunRepo
         timeoutMs,
         workDir,
       });
-      const findings = redactValue(buildFindings(groundTruth.tools, result), redact);
+      const findings = buildFindings(groundTruth.tools, result);
       adapterReports.push({
         acknowledgedFindings: [],
         adapter: result.adapter,
-        canary: redactValue(result.canary, redact),
+        canary: result.canary,
         durationMs: result.durationMs,
         findings,
         newFindings: findings,
         resolvedVersion: result.resolvedVersion,
         status: result.status,
-        statusDetail: result.statusDetail === null ? null : redact(result.statusDetail),
+        statusDetail: result.statusDetail,
         toolCount: result.surface === null ? null : result.surface.tools.length,
       });
     }
@@ -203,21 +252,21 @@ export async function runCrosscheck(options: CrosscheckOptions): Promise<RunRepo
       comparisonSucceeded: adapter.status === 'ok' && adapter.toolCount !== null,
       findings: adapter.findings,
     }));
-    const eligibleForUpdate = states.every(
-      (state) =>
-        state.comparisonSucceeded &&
-        !state.findings.some(
-          (finding) =>
-            finding.rule === 'adapter-broken' ||
-            finding.rule === 'handshake-failure' ||
-            finding.rule === 'canary-failed',
-        ),
-    );
+    // A truncated capture compared only the pages read: it can neither rewrite
+    // reviewed entries nor call one stale.
+    const eligibleForUpdate =
+      truncation === null &&
+      states.every(
+        (state) =>
+          state.comparisonSucceeded &&
+          !state.findings.some((finding) => RUNTIME_RULES.has(finding.rule)),
+      );
     if (updateRequested && baselinePath !== null && eligibleForUpdate) {
       baseline = updateBaseline(baseline, states);
       await writeBaselineAtomic(baselinePath, baseline);
     }
     const reconciliation = reconcileBaseline(baseline, states);
+    const baselineDiagnostics = truncation === null ? reconciliation.baselineDiagnostics : [];
     for (const adapter of adapterReports) {
       const reconciled = reconciliation.adapters.find((entry) => entry.adapter === adapter.adapter);
       adapter.newFindings = reconciled?.newFindings ?? adapter.findings;
@@ -226,7 +275,10 @@ export async function runCrosscheck(options: CrosscheckOptions): Promise<RunRepo
 
     const allFindings = adapterReports.flatMap((adapter) => adapter.newFindings);
     const failCount = allFindings.filter((finding) => finding.severity === 'fail').length;
-    const infoCount = allFindings.filter((finding) => finding.severity === 'info').length;
+    // Ground-truth notes are info tier by type: they count as info and never change `pass`.
+    const notes = groundTruthFindings(groundTruth.tools);
+    const infoCount =
+      allFindings.filter((finding) => finding.severity === 'info').length + notes.length;
 
     const reportTarget: RunReport['target'] =
       target.kind === 'http'
@@ -239,22 +291,28 @@ export async function runCrosscheck(options: CrosscheckOptions): Promise<RunRepo
         0,
       ),
       adapters: adapterReports,
-      baselineDiagnostics: reconciliation.baselineDiagnostics,
+      baselineDiagnostics,
       crosscheckVersion: VERSION,
       failCount,
       groundTruth: {
         canary: groundTruthCanary,
+        depthLimitedPaths: depthLimitedPaths(groundTruth.tools),
+        findings: notes,
         serverName: groundTruth.serverName,
         serverVersion: groundTruth.serverVersion,
         toolCount: groundTruth.tools.length,
         toolNames: groundTruth.tools.map((tool) => tool.name),
+        truncation,
       },
       infoCount,
-      pass: failCount === 0,
-      staleCount: reconciliation.baselineDiagnostics.length,
+      // Tools past a truncated walk were never compared, so no finding count can pass the run.
+      pass: failCount === 0 && truncation === null,
+      reportVersion: 1,
+      staleCount: baselineDiagnostics.length,
       target: reportTarget,
     };
-    const safeReport = redactValue(report, redact);
+    // One pass over the report's free text; identities reached the baseline unredacted above.
+    const safeReport = redactRunReport(report, redact);
     registerReportRedactor(safeReport, redact);
     return safeReport;
   } catch (error) {

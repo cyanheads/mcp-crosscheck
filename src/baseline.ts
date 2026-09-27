@@ -5,7 +5,7 @@
 import { randomUUID } from 'node:crypto';
 import { rename, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
-
+import { CONSTRAINT_KEYWORDS, isRecord } from './schema.js';
 import type {
   AdapterName,
   BaselineableRuleId,
@@ -14,13 +14,35 @@ import type {
   BaselineEntry,
   BaselineEvidence,
   Finding,
+  GroundTruthRuleId,
+  RuleId,
 } from './types.js';
+import { canonicalize, canonicalJson } from './util/canonical-json.js';
 
 const ADAPTERS = new Set<AdapterName>(['claude-code', 'codex', 'inspector', 'mcpo']);
-const RUNTIME_RULES = new Set(['adapter-broken', 'canary-failed', 'handshake-failure']);
+
+/** Rules describing a failed run rather than a rendered surface — never baselineable. */
+export const RUNTIME_RULES: ReadonlySet<string> = new Set<RuleId>([
+  'adapter-broken',
+  'canary-failed',
+  'handshake-failure',
+]);
+/**
+ * Rules describing the advertised surface itself, reported under
+ * `groundTruth.findings` — never baselineable. Keyed by `GroundTruthRuleId`,
+ * so a new ground-truth rule does not typecheck until it is listed here.
+ */
+const GROUND_TRUTH_RULES: ReadonlySet<string> = new Set(
+  Object.keys({
+    'sdk-v1-rejected': true,
+    'unsupported-dialect': true,
+  } satisfies Record<GroundTruthRuleId, true>),
+);
 const RULE_FOR_KIND: Record<BaselineEvidence['kind'], BaselineableRuleId> = {
   'anyof-ignored': 'anyof-ignored',
+  'constraint-altered': 'constraint-altered',
   'constraint-dropped': 'constraint-dropped',
+  'description-altered': 'description-altered',
   'description-lost': 'description-lost',
   'input-empty': 'empty-request-body',
   'output-field-missing': 'output-schema-divergence',
@@ -28,6 +50,7 @@ const RULE_FOR_KIND: Record<BaselineEvidence['kind'], BaselineableRuleId> = {
   'output-field-untyped': 'output-schema-divergence',
   'output-nested-empty': 'output-schema-divergence',
   'output-root-empty': 'output-schema-divergence',
+  'property-excluded': 'property-excluded',
   'property-missing': 'property-missing',
   'property-retyped': 'property-retyped',
   'property-untyped': 'property-untyped',
@@ -38,22 +61,29 @@ const RULE_FOR_KIND: Record<BaselineEvidence['kind'], BaselineableRuleId> = {
 /** An actionable baseline document error; callers expose it as a usage error. */
 export class BaselineValidationError extends Error {}
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
 function hasExactKeys(value: Record<string, unknown>, keys: string[]): boolean {
   const actual = Object.keys(value).sort();
   return actual.length === keys.length && actual.every((key, index) => key === keys[index]);
 }
 
-function isSortedUniqueStrings(value: unknown): value is string[] {
+const CONSTRAINT_KEYWORD_SET: ReadonlySet<string> = new Set(CONSTRAINT_KEYWORDS);
+
+/**
+ * A set as the engine emits it: non-empty and strictly ascending, so sorted and
+ * free of repeats. Members are whatever strings the server wrote, the empty
+ * string included; `isMember` narrows them to a closed vocabulary.
+ */
+function isCanonicalSet(
+  value: unknown,
+  isMember: (member: string) => boolean = () => true,
+): value is string[] {
   return (
     Array.isArray(value) &&
+    value.length > 0 &&
     value.every(
       (entry, index) =>
         typeof entry === 'string' &&
-        entry !== '' &&
+        isMember(entry) &&
         (index === 0 || (value[index - 1] as string) < entry),
     )
   );
@@ -63,10 +93,19 @@ function positiveInteger(value: unknown): value is number {
   return Number.isSafeInteger(value) && Number(value) > 0;
 }
 
+/**
+ * `null` is accepted for untyped ground truth: the engine no longer reports it,
+ * but entries an earlier version wrote still parse and reconcile as stale.
+ */
 function nullableString(value: unknown): value is string | null {
-  return value === null || (typeof value === 'string' && value !== '');
+  return value === null || typeof value === 'string';
 }
 
+/**
+ * Validate one evidence object against exactly the values the engine can emit,
+ * so an entry that could never match a finding is rejected rather than left
+ * stale. Server-authored strings (a type, a required name) may be empty.
+ */
 function parseEvidence(value: unknown): BaselineEvidence {
   if (!isRecord(value) || typeof value.kind !== 'string') {
     throw new BaselineValidationError('baseline evidence must be an object with a known kind');
@@ -75,6 +114,7 @@ function parseEvidence(value: unknown): BaselineEvidence {
     case 'tool-missing':
     case 'anyof-ignored':
     case 'output-field-missing':
+    case 'property-excluded':
       if (hasExactKeys(value, ['kind'])) return value as BaselineEvidence;
       break;
     case 'input-empty':
@@ -108,10 +148,9 @@ function parseEvidence(value: unknown): BaselineEvidence {
     case 'output-field-retyped':
       if (
         hasExactKeys(value, ['from', 'kind', 'to']) &&
-        nullableString(value.from) &&
-        nullableString(value.to) &&
-        value.from !== null &&
-        value.to !== null
+        typeof value.from === 'string' &&
+        typeof value.to === 'string' &&
+        value.from !== value.to
       ) {
         return value as BaselineEvidence;
       }
@@ -124,13 +163,26 @@ function parseEvidence(value: unknown): BaselineEvidence {
         return value as BaselineEvidence;
       }
       break;
+    case 'description-altered':
+      if (
+        hasExactKeys(value, ['change', 'kind', 'subject']) &&
+        (value.change === 'rewritten' || value.change === 'truncated') &&
+        (value.subject === 'tool' || value.subject === 'property')
+      ) {
+        return value as BaselineEvidence;
+      }
+      break;
+    case 'constraint-altered':
     case 'constraint-dropped':
-      if (hasExactKeys(value, ['keywords', 'kind']) && isSortedUniqueStrings(value.keywords)) {
+      if (
+        hasExactKeys(value, ['keywords', 'kind']) &&
+        isCanonicalSet(value.keywords, (keyword) => CONSTRAINT_KEYWORD_SET.has(keyword))
+      ) {
         return value as BaselineEvidence;
       }
       break;
     case 'required-dropped':
-      if (hasExactKeys(value, ['kind', 'names']) && isSortedUniqueStrings(value.names)) {
+      if (hasExactKeys(value, ['kind', 'names']) && isCanonicalSet(value.names)) {
         return value as BaselineEvidence;
       }
       break;
@@ -147,22 +199,9 @@ function parseEvidence(value: unknown): BaselineEvidence {
   throw new BaselineValidationError(`invalid baseline evidence for kind "${value.kind}"`);
 }
 
-function canonicalize(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(canonicalize);
-  if (!isRecord(value)) return value;
-  return Object.fromEntries(
-    Object.keys(value)
-      .sort()
-      .map((key) => [key, canonicalize(value[key])]),
-  );
-}
-
-function canonicalEvidence(evidence: BaselineEvidence): string {
-  return JSON.stringify(canonicalize(evidence));
-}
-
-function normalizeEvidenceSets(evidence: BaselineEvidence): BaselineEvidence {
-  if (evidence.kind === 'constraint-dropped') {
+/** Evidence in the canonical form a baseline persists: keyword and name sets deduplicated and sorted. */
+function canonicalEvidence(evidence: BaselineEvidence): BaselineEvidence {
+  if (evidence.kind === 'constraint-dropped' || evidence.kind === 'constraint-altered') {
     return { ...evidence, keywords: [...new Set(evidence.keywords)].sort() };
   }
   if (evidence.kind === 'required-dropped') {
@@ -171,17 +210,26 @@ function normalizeEvidenceSets(evidence: BaselineEvidence): BaselineEvidence {
   return evidence;
 }
 
+/**
+ * UTF-16 code-unit order. Unlike `localeCompare` it is total and independent
+ * of the host locale, so one set of entries serializes to the same bytes on
+ * every machine.
+ */
+function compareCodeUnits(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 function compareEntries(left: BaselineEntry, right: BaselineEntry): number {
   return (
-    left.adapter.localeCompare(right.adapter) ||
-    left.rule.localeCompare(right.rule) ||
-    left.path.localeCompare(right.path) ||
-    canonicalEvidence(left.evidence).localeCompare(canonicalEvidence(right.evidence))
+    compareCodeUnits(left.adapter, right.adapter) ||
+    compareCodeUnits(left.rule, right.rule) ||
+    compareCodeUnits(left.path, right.path) ||
+    compareCodeUnits(canonicalJson(left.evidence), canonicalJson(right.evidence))
   );
 }
 
 function entryIdentity(entry: BaselineEntry): string {
-  return `${entry.adapter}\u0000${entry.rule}\u0000${entry.path}\u0000${canonicalEvidence(entry.evidence)}`;
+  return `${entry.adapter}\u0000${entry.rule}\u0000${entry.path}\u0000${canonicalJson(entry.evidence)}`;
 }
 
 function parseEntry(value: unknown): BaselineEntry {
@@ -193,11 +241,16 @@ function parseEntry(value: unknown): BaselineEntry {
   if (typeof value.adapter !== 'string' || !ADAPTERS.has(value.adapter as AdapterName)) {
     throw new BaselineValidationError(`unknown baseline adapter "${String(value.adapter)}"`);
   }
-  if (typeof value.rule !== 'string' || RUNTIME_RULES.has(value.rule)) {
+  if (
+    typeof value.rule !== 'string' ||
+    RUNTIME_RULES.has(value.rule) ||
+    GROUND_TRUTH_RULES.has(value.rule)
+  ) {
     throw new BaselineValidationError(`rule "${String(value.rule)}" is not baselineable`);
   }
-  if (typeof value.path !== 'string' || value.path === '') {
-    throw new BaselineValidationError('baseline entry path must be a non-empty string');
+  // A tool may be named '' — its path is the empty string.
+  if (typeof value.path !== 'string') {
+    throw new BaselineValidationError('baseline entry path must be a string');
   }
   const evidence = parseEvidence(value.evidence);
   const expectedRule = RULE_FOR_KIND[evidence.kind];
@@ -247,15 +300,27 @@ export function parseBaseline(text: string): BaselineDocument {
   return { baselineVersion: 1, entries };
 }
 
-/** Serialize a deterministic canonical version-1 baseline. */
+/**
+ * Serialize a deterministic canonical version-1 baseline: canonical evidence,
+ * one entry per identity, sorted. Distinct findings can share an identity — a
+ * dotted tool or property name makes two paths alike, and a tool listed twice
+ * repeats its findings — and one entry acknowledges them all.
+ */
 export function serializeBaseline(document: BaselineDocument): string {
-  const entries = document.entries
-    .map((entry) => ({ ...entry, evidence: normalizeEvidenceSets(entry.evidence) }))
-    .sort(compareEntries);
+  const byIdentity = new Map<string, BaselineEntry>();
+  for (const entry of document.entries) {
+    const canonical = { ...entry, evidence: canonicalEvidence(entry.evidence) };
+    byIdentity.set(entryIdentity(canonical), canonical);
+  }
+  const entries = [...byIdentity.values()].sort(compareEntries);
   return `${JSON.stringify(canonicalize({ baselineVersion: 1, entries }), null, 2)}\n`;
 }
 
-/** Convert one rendering finding to its persisted identity; runtime findings return null. */
+/**
+ * Convert one rendering finding to its persisted identity, with canonical
+ * evidence so it matches the entry a baseline stores for it; runtime and
+ * ground-truth findings return null.
+ */
 export function baselineEntryFromFinding(
   adapter: AdapterName,
   finding: Finding,
@@ -264,13 +329,15 @@ export function baselineEntryFromFinding(
     finding.path === null ||
     finding.evidence.kind === 'adapter-broken' ||
     finding.evidence.kind === 'canary-failed' ||
-    finding.evidence.kind === 'handshake-failure'
+    finding.evidence.kind === 'handshake-failure' ||
+    finding.evidence.kind === 'sdk-v1-rejected' ||
+    finding.evidence.kind === 'unsupported-dialect'
   ) {
     return null;
   }
   return {
     adapter,
-    evidence: finding.evidence,
+    evidence: canonicalEvidence(finding.evidence),
     path: finding.path,
     rule: finding.rule as BaselineableRuleId,
   };
@@ -303,13 +370,12 @@ export function reconcileBaseline(
     const acknowledgedFindings: Finding[] = [];
     const newFindings: Finding[] = [];
     for (const finding of state.findings) {
-      const entry = baselineEntryFromFinding(state.adapter, finding);
-      if (state.comparisonSucceeded && entry !== null) currentIdentities.add(entryIdentity(entry));
-      if (
-        state.comparisonSucceeded &&
-        entry !== null &&
-        baselineIdentities.has(entryIdentity(entry))
-      ) {
+      const entry = state.comparisonSucceeded
+        ? baselineEntryFromFinding(state.adapter, finding)
+        : null;
+      const identity = entry === null ? null : entryIdentity(entry);
+      if (identity !== null) currentIdentities.add(identity);
+      if (identity !== null && baselineIdentities.has(identity)) {
         acknowledgedFindings.push(finding);
       } else {
         newFindings.push(finding);

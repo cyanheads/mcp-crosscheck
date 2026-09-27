@@ -9,6 +9,17 @@
  * Run it directly:
  *   bun tests/fixture-server/server.ts
  *   MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=8901 bun tests/fixture-server/server.ts
+ *
+ * `MCP_FIXTURE_TOOLS`, a JSON tool array, replaces the advertised tools for a
+ * test that needs a surface the fixture does not carry.
+ *
+ * Switches that misbehave on purpose, all off by default:
+ *   MCP_FIXTURE_PAGE_SIZE=<n>        page `tools/list` n tools at a time
+ *   MCP_FIXTURE_CURSOR=repeat        answer every page with the same `nextCursor`
+ *   MCP_FIXTURE_CURSOR=cycle         alternate `nextCursor` between two values
+ *   MCP_FIXTURE_INVALID_OUTPUT=mismatch|missing
+ *                                    `nested_config` answers with `structuredContent`
+ *                                    that violates its `outputSchema`, or with none
  */
 import { randomUUID } from 'node:crypto';
 import { appendFile } from 'node:fs/promises';
@@ -18,7 +29,13 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
-import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import {
+  CallToolRequestSchema,
+  ErrorCode,
+  ListToolsRequestSchema,
+  McpError,
+  type Tool,
+} from '@modelcontextprotocol/sdk/types.js';
 
 import {
   FIXTURE_SERVER_NAME,
@@ -29,13 +46,60 @@ import {
 
 const DEFAULT_HTTP_PORT = 8901;
 
+const ADVERTISED_TOOLS: Tool[] =
+  process.env.MCP_FIXTURE_TOOLS === undefined
+    ? FIXTURE_TOOLS
+    : JSON.parse(process.env.MCP_FIXTURE_TOOLS);
+
+const PAGE_SIZE = Math.max(
+  1,
+  Number(process.env.MCP_FIXTURE_PAGE_SIZE ?? (ADVERTISED_TOOLS.length || 1)),
+);
+const CURSOR_MODE = process.env.MCP_FIXTURE_CURSOR;
+const INVALID_OUTPUT = process.env.MCP_FIXTURE_INVALID_OUTPUT;
+
+/**
+ * The page a cursor names. Well-behaved cursors are `page-<index>`; `repeat`
+ * serves page 1, and the `cycle` pair `a`/`b` serve pages 1 and 2.
+ */
+function pageIndex(cursor: string | undefined): number {
+  if (cursor === undefined) return 0;
+  if (cursor === 'repeat' || cursor === 'a') return 1;
+  if (cursor === 'b') return 2;
+  const match = /^page-(\d+)$/.exec(cursor);
+  if (match === null) throw new McpError(ErrorCode.InvalidParams, `unknown cursor: ${cursor}`);
+  return Number(match[1]);
+}
+
+/** The `nextCursor` after one page, or undefined on the last page of a well-behaved list. */
+function nextCursorAfter(index: number): string | undefined {
+  if (CURSOR_MODE === 'repeat') return 'repeat';
+  if (CURSOR_MODE === 'cycle') return index % 2 === 0 ? 'a' : 'b';
+  return (index + 1) * PAGE_SIZE < ADVERTISED_TOOLS.length ? `page-${index + 1}` : undefined;
+}
+
+/** `nested_config`'s structured result, or the invalid one a switch asks for. */
+function structuredResultFor(name: string): Record<string, unknown> | undefined {
+  const result = FIXTURE_STRUCTURED_RESULTS[name];
+  if (name !== 'nested_config' || INVALID_OUTPUT === undefined) return result;
+  if (INVALID_OUTPUT === 'missing') return undefined;
+  return { ...result, summary: { connected: 'yes' } };
+}
+
 function createFixtureServer(): Server {
   const server = new Server(
     { name: FIXTURE_SERVER_NAME, version: FIXTURE_SERVER_VERSION },
     { capabilities: { tools: {} } },
   );
 
-  server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: FIXTURE_TOOLS }));
+  server.setRequestHandler(ListToolsRequestSchema, (request) => {
+    const index = pageIndex(request.params?.cursor);
+    const nextCursor = nextCursorAfter(index);
+    return {
+      tools: ADVERTISED_TOOLS.slice(index * PAGE_SIZE, (index + 1) * PAGE_SIZE),
+      ...(nextCursor === undefined ? {} : { nextCursor }),
+    };
+  });
 
   /**
    * Every tool echoes the arguments it received, so a canary round-trip proves
@@ -44,10 +108,10 @@ function createFixtureServer(): Server {
    */
   server.setRequestHandler(CallToolRequestSchema, (request) => {
     const { arguments: args, name } = request.params;
-    if (!FIXTURE_TOOLS.some((tool) => tool.name === name)) {
+    if (!ADVERTISED_TOOLS.some((tool) => tool.name === name)) {
       return { content: [{ text: `unknown tool: ${name}`, type: 'text' }], isError: true };
     }
-    const structuredContent = FIXTURE_STRUCTURED_RESULTS[name];
+    const structuredContent = structuredResultFor(name);
     return {
       content: [{ text: JSON.stringify(args ?? {}), type: 'text' }],
       ...(structuredContent === undefined ? {} : { structuredContent }),
@@ -85,9 +149,18 @@ async function recordRequest(request: IncomingMessage, body: unknown): Promise<v
   if (path === undefined) return;
   const headerName = process.env.MCP_REQUIRED_HEADER_NAME?.toLowerCase();
   const header = headerName === undefined ? null : (request.headers[headerName] ?? null);
-  const rpcMethod =
-    typeof body === 'object' && body !== null && 'method' in body ? String(body.method) : null;
-  await appendFile(path, `${JSON.stringify({ header, method: request.method, rpcMethod })}\n`);
+  const rpc = typeof body === 'object' && body !== null ? (body as Record<string, unknown>) : {};
+  const rpcMethod = 'method' in rpc ? String(rpc.method) : null;
+  const params = rpc.params;
+  // Only a paged request carries the key, so earlier record shapes are unchanged.
+  const cursor =
+    typeof params === 'object' && params !== null && 'cursor' in params
+      ? { cursor: params.cursor }
+      : {};
+  await appendFile(
+    path,
+    `${JSON.stringify({ header, method: request.method, rpcMethod, ...cursor })}\n`,
+  );
 }
 
 async function handleHttpRequest(request: IncomingMessage, response: ServerResponse) {

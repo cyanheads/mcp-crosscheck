@@ -27,6 +27,22 @@ export interface GroundTruthTool {
   name: string;
   /** Result schema, present only for the tools that advertise one. */
   outputSchema?: JsonSchema;
+  /**
+   * Where the `Tool` schema of `@modelcontextprotocol/sdk` 1.x rejects this
+   * tool, one `<path>: <message>` entry per failing location. Present only
+   * when it rejects: a client on that SDK then rejects the whole list.
+   */
+  sdkV1Rejection?: string[];
+}
+
+/** Why a `tools/list` walk ended before the server's last page. */
+export interface GroundTruthTruncation {
+  pagesRead: number;
+  /**
+   * `cursor-repeated`: a page's `nextCursor` equals a cursor already sent.
+   * `page-cap`: the walk's page limit was reached with a `nextCursor` in hand.
+   */
+  reason: 'cursor-repeated' | 'page-cap';
 }
 
 /** The server's own advertised surface, captured via the official MCP SDK client. */
@@ -34,6 +50,8 @@ export interface GroundTruth {
   serverName: string | null;
   serverVersion: string | null;
   tools: GroundTruthTool[];
+  /** Null only when the last page read carried no `nextCursor`: the list is complete. */
+  truncation: GroundTruthTruncation | null;
 }
 
 /**
@@ -46,11 +64,28 @@ export interface RenderedProperty {
   /** Validation-bearing keywords present on the property (minimum, pattern, enum, ...). */
   constraints: Record<string, unknown>;
   /**
-   * `root` when the property is declared in the containing schema's `properties`,
-   * `branch` when it appears only inside one of that schema's `anyOf`/`oneOf` branches.
+   * `root` when the property applies unconditionally — declared in the containing
+   * schema's own `properties` or in one of its `allOf` members — and `branch` when
+   * it appears only inside one of that level's `anyOf`/`oneOf` branches.
    */
   declaredIn: 'branch' | 'root';
+  /**
+   * Set when the walk stopped here at the normalizer's depth limit while the
+   * schema still declares fields (its own, an `allOf` member's, or an
+   * `anyOf`/`oneOf` branch's) or an element schema: nothing below this
+   * property was normalized, so nothing below it is compared. A loop back to a
+   * schema already on the path is never marked — that schema was compared
+   * where it first appeared.
+   */
+  depthLimited?: true;
   description: string | null;
+  /**
+   * True when a closed schema at the containing level (its own or an `allOf`
+   * member's `additionalProperties: false`) neither lists nor pattern-matches
+   * this property, so no value for it validates. Normalized surfaces populate
+   * it; legacy producers may omit.
+   */
+  excluded?: boolean;
   /** Canonical explicit `type`; normalized surfaces populate it, while legacy producers may omit. */
   explicitType?: string | null;
   /** Element schema when this property is an array; omitted when it declares no `items`. */
@@ -91,23 +126,37 @@ export type RuleId =
   | 'adapter-broken'
   | 'anyof-ignored'
   | 'canary-failed'
+  | 'constraint-altered'
   | 'constraint-dropped'
+  | 'description-altered'
   | 'description-lost'
   | 'empty-request-body'
   | 'handshake-failure'
   | 'output-schema-divergence'
+  | 'property-excluded'
   | 'property-missing'
   | 'property-retyped'
   | 'property-untyped'
   | 'required-dropped'
-  | 'tool-missing';
+  | 'sdk-v1-rejected'
+  | 'tool-missing'
+  | 'unsupported-dialect';
+
+/**
+ * Rules that describe the advertised surface itself rather than a client's
+ * rendering of it. They are the same for every adapter, so they are reported
+ * once, under `RunReport['groundTruth'].findings`, and are never baselined.
+ */
+export type GroundTruthRuleId = 'sdk-v1-rejected' | 'unsupported-dialect';
 
 /** Stable machine facts carried by a finding; human `detail` is never an identity source. */
 export type FindingEvidence =
   | { kind: 'adapter-broken' }
   | { kind: 'anyof-ignored' }
   | { kind: 'canary-failed' }
+  | { keywords: string[]; kind: 'constraint-altered' }
   | { keywords: string[]; kind: 'constraint-dropped' }
+  | { change: 'rewritten' | 'truncated'; kind: 'description-altered'; subject: 'property' | 'tool' }
   | { kind: 'description-lost'; subject: 'property' | 'tool' }
   | {
       branchOnly: boolean;
@@ -116,6 +165,7 @@ export type FindingEvidence =
       scope: 'nested' | 'root';
     }
   | { kind: 'handshake-failure' }
+  | { kind: 'property-excluded' }
   | { declaredIn: 'branch' | 'root'; kind: 'property-missing' }
   | { groundTruthType: string | null; kind: 'property-untyped' }
   | { from: string; kind: 'property-retyped'; to: string }
@@ -125,18 +175,20 @@ export type FindingEvidence =
   | { groundTruthType: string | null; kind: 'output-field-untyped' }
   | { from: string; kind: 'output-field-retyped'; to: string }
   | { expectedPropertyCount: number; kind: 'output-root-empty' }
-  | { expectedPropertyCount: number; kind: 'output-nested-empty' };
+  | { expectedPropertyCount: number; kind: 'output-nested-empty' }
+  | { kind: 'sdk-v1-rejected' }
+  | { declared: string; kind: 'unsupported-dialect' };
 
 /** Rendering-only evidence accepted by a compatibility baseline. */
 export type BaselineEvidence = Exclude<
   FindingEvidence,
-  { kind: 'adapter-broken' | 'canary-failed' | 'handshake-failure' }
+  { kind: 'adapter-broken' | 'canary-failed' | 'handshake-failure' | GroundTruthRuleId }
 >;
 
 /** Rules that describe a rendered surface and may be acknowledged in a baseline. */
 export type BaselineableRuleId = Exclude<
   RuleId,
-  'adapter-broken' | 'canary-failed' | 'handshake-failure'
+  'adapter-broken' | 'canary-failed' | 'handshake-failure' | GroundTruthRuleId
 >;
 
 /** One divergence between ground truth and a rendered surface. */
@@ -148,6 +200,17 @@ export interface Finding {
   rule: RuleId;
   severity: Severity;
 }
+
+/**
+ * A note about the advertised surface itself, reported once for the run.
+ * Always info tier: it is counted in `infoCount`, never changes `pass`, and
+ * never enters a baseline.
+ */
+export type GroundTruthFinding = Finding & {
+  evidence: Extract<FindingEvidence, { kind: GroundTruthRuleId }>;
+  rule: GroundTruthRuleId;
+  severity: 'info';
+};
 
 /** Outcome of the canary round-trip through one path (ground truth or an adapter). */
 export interface CanaryOutcome {
@@ -251,13 +314,40 @@ export interface RunReport {
   failCount: number;
   groundTruth: {
     canary: CanaryOutcome | null;
+    /**
+     * Where the comparison stopped at the normalizer's depth limit, in finding
+     * path syntax (`[]` for array elements, `output:` for an `outputSchema`),
+     * sorted. Nothing below these paths was compared. Not a finding: it is the
+     * same for every adapter, never baselined, and never changes `pass`.
+     */
+    depthLimitedPaths: string[];
+    /** Notes about the advertised surface itself, in tool order. */
+    findings: GroundTruthFinding[];
     serverName: string | null;
     serverVersion: string | null;
     toolCount: number;
     toolNames: string[];
+    /**
+     * Why the `tools/list` walk stopped before the server's last page, or null
+     * when it read the whole list. A truncated capture fails the run: tools
+     * past the pages read were never compared.
+     */
+    truncation: GroundTruthTruncation | null;
   };
   infoCount: number;
+  /** `failCount === 0 && groundTruth.truncation === null`. */
   pass: boolean;
+  /** Shape version of this report contract; bumps only on an incompatible change. */
+  reportVersion: 1;
   staleCount: number;
   target: { kind: 'stdio'; command: string; args: string[] } | { kind: 'http'; url: string };
+}
+
+/**
+ * What `--json` prints when a run ends without a report. `usage` is a caller
+ * mistake (exit 2); `runtime` is a failure while running (exit 1).
+ */
+export interface ErrorReport {
+  error: { kind: 'runtime' | 'usage'; message: string };
+  reportVersion: 1;
 }

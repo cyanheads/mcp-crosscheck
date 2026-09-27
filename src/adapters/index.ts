@@ -9,7 +9,7 @@ import { codexAdapter } from './codex.js';
 import { inspectorAdapter } from './inspector.js';
 import { mcpoAdapter } from './mcpo.js';
 
-/** All known adapters, in default execution order. */
+/** Every known adapter, keyed by name; `--adapters` decides which run and in what order. */
 export const ADAPTERS: Record<AdapterName, Adapter> = {
   'claude-code': claudeCodeAdapter,
   codex: codexAdapter,
@@ -20,6 +20,7 @@ export const ADAPTERS: Record<AdapterName, Adapter> = {
 /** Adapters exercised when `--adapters` is not given. */
 export const DEFAULT_ADAPTERS: AdapterName[] = ['inspector', 'mcpo'];
 
+/** True only for a registry's own key — inherited names such as `toString` never qualify. */
 export function isAdapterName(value: string): value is AdapterName {
-  return value in ADAPTERS;
+  return Object.hasOwn(ADAPTERS, value);
 }

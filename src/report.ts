@@ -6,7 +6,23 @@
 import { styleText } from 'node:util';
 
 import { redactReport } from './redact.js';
-import type { AdapterReport, Finding, RunReport } from './types.js';
+import type {
+  AdapterReport,
+  ErrorReport,
+  Finding,
+  GroundTruthTruncation,
+  RunReport,
+} from './types.js';
+
+const TRUNCATION_REASONS: Record<GroundTruthTruncation['reason'], string> = {
+  'cursor-repeated': 'the server repeated a cursor',
+  'page-cap': 'the page cap was reached with a nextCursor still in hand',
+};
+
+/** Why an incomplete `tools/list` walk stopped, with its page count. */
+export function truncationNote(truncation: GroundTruthTruncation): string {
+  return `tools/list stopped after ${truncation.pagesRead} page(s): ${TRUNCATION_REASONS[truncation.reason]}`;
+}
 
 function paint(format: Parameters<typeof styleText>[0], text: string): string {
   return styleText(format, text, { validateStream: true });
@@ -56,14 +72,28 @@ export function renderHumanReport(input: RunReport): string {
     report.groundTruth.serverName === null
       ? targetLabel
       : `${report.groundTruth.serverName}@${report.groundTruth.serverVersion ?? '?'}`;
+  const { truncation } = report.groundTruth;
+  const truncated = truncation === null ? '' : truncationNote(truncation);
 
   lines.push(
     `${paint('bold', `mcp-crosscheck v${report.crosscheckVersion}`)} ${paint('dim', '→')} ${serverLabel} ${paint(
       'dim',
       `(${report.groundTruth.toolCount} tools advertised)`,
-    )}`,
+    )}${truncated === '' ? '' : ` ${paint(['red', 'bold'], truncated)}`}`,
   );
   lines.push('');
+
+  const { depthLimitedPaths, findings } = report.groundTruth;
+  if (findings.length > 0 || depthLimitedPaths.length > 0) {
+    lines.push(paint('bold', 'Ground truth'));
+    for (const finding of findings) lines.push(renderFinding(finding));
+    for (const path of depthLimitedPaths) {
+      lines.push(
+        `  ${paint('dim', 'depth limit')} ${paint('cyan', path)} — the fields below it were not compared`,
+      );
+    }
+    lines.push('');
+  }
 
   for (const adapter of report.adapters) {
     lines.push(adapterHeadline(adapter));
@@ -108,7 +138,7 @@ export function renderHumanReport(input: RunReport): string {
       )
     : paint(
         ['red', 'bold'],
-        `FAIL — ${report.failCount} new failure(s), ${report.infoCount} new info note(s), ${report.acknowledgedCount} acknowledged, ${report.staleCount} stale across ${report.adapters.length} adapter(s)`,
+        `FAIL — ${truncated === '' ? '' : `${truncated}; `}${report.failCount} new failure(s), ${report.infoCount} new info note(s), ${report.acknowledgedCount} acknowledged, ${report.staleCount} stale across ${report.adapters.length} adapter(s)`,
       );
   lines.push(summary);
   return lines.join('\n');
@@ -117,4 +147,10 @@ export function renderHumanReport(input: RunReport): string {
 /** The stable machine-readable shape emitted by `--json`. */
 export function toJsonReport(report: RunReport): string {
   return JSON.stringify(redactReport(report), null, 2);
+}
+
+/** The `--json` document for a run that ended without a report; `message` must already be redacted. */
+export function toJsonError(kind: ErrorReport['error']['kind'], message: string): string {
+  const document: ErrorReport = { error: { kind, message }, reportVersion: 1 };
+  return JSON.stringify(document, null, 2);
 }

@@ -40,13 +40,14 @@ Inspector receives HTTP header values in its process arguments. They may be visi
 | Version | A pin is passed to `uvx`; unpinned runs resolve the exercised release from the client or PyPI |
 | Output | Parses a generated response model when the OpenAPI document contains one |
 
-The mcpo child argument contains the configured values. Its raw `openapi.json` artifact is server-controlled and remains local-sensitive.
+The mcpo child argument contains the configured values. Its raw `mcpo.openapi.json` artifact is server-controlled and remains local-sensitive.
 
 ### Dated measurements
 
 | Date | Client | Evidence | Reproduction constraint | Measured surface |
 |:--|:--|:--|:--|:--|
 | 2026-08-09 | mcpo 0.0.20 | `tests/fixtures/mcpo-openapi.json`, `tests/fixtures/ground-truth.json`, and `src/adapters/adapters.test.ts` | Run with `--mcpo-with 'mcp<2'`; this is an environment constraint, not a property of mcpo 0.0.20 | Form-model `$ref`s preserved the tested tool descriptions, property types, required fields, nested requests, and generated response models. The comparison recorded dropped `enum` and numeric bounds. The fixture has no root input union or advertised `outputSchema`, so it does not measure root-input-union handling or end-to-end output-schema fidelity. |
+| 2026-09-26 | mcpo 0.0.20 | Local `--artifacts` capture against a stdio scratch server; no new frozen fixture | Run with `--mcpo-with 'mcp<2'` | A root input schema composed only of `allOf` members generated `requestBody: null`, recorded as `empty-request-body`. A root-recursive schema whose array items use a whole-document `$ref: "#"` stopped mcpo at startup with `KeyError: '#'`, recorded as `adapter-broken`. A map property with `additionalProperties: {type: 'string'}` rendered as `additionalProperties: true`, recorded as `constraint-altered`. A property written as a one-member `allOf` around an `enum` `$ref` rendered with its description but no type or `enum`, recorded as `property-untyped` and `constraint-dropped`. |
 
 ## Codex CLI
 
@@ -80,6 +81,7 @@ The managed Codex child receives only its isolated homes, generated header varia
 | Selection | Opt-in |
 | Targets | stdio only |
 | Capture | Runs the installed `claude` executable with isolated `HOME` and `CLAUDE_CONFIG_DIR`, `--bare`, one strict MCP config, dummy auth, and a loopback base URL; captures the first tools-bearing request |
+| Executable | `claude` on `PATH`, launched without a shell. On Windows that means the native installer's `claude.exe`: an npm global install provides only a `claude.cmd` shim, and a missing executable is `adapter-broken` with that explanation |
 | Canary | None; capture-only |
 | Version | Resolves `claude --version`. A `claude-code` pin must exactly match the installed version; a mismatch is `adapter-broken` and the client is not launched |
 | Output | Parses exact `mcp__target__<tool>` entries from `description` and `input_schema`; native tools are ignored and no output surface is exposed |
@@ -90,7 +92,8 @@ Full `claude-code.request.json` artifacts can contain prompt, session, and clien
 
 | Date | Client | Evidence | Reproduction constraint | Measured surface |
 |:--|:--|:--|:--|:--|
-| 2026-08-13 | Claude Code 2.1.231 | `tests/fixtures/claude-code-request.json` and `src/adapters/adapters.test.ts` | Isolated `HOME`/`CLAUDE_CONFIG_DIR`, `--bare --strict-mcp-config --mcp-config … --print ping`, and loopback `POST /v1/messages?beta=true` | Flat MCP entries carried `description` and `input_schema` with no output surface. Against the bundled fixture, root `anyOf` branches were flattened into properties. The other exercised descriptions, types, required names, nested schemas, and constraints survived. |
+| 2026-08-13 | Claude Code 2.1.231 | `tests/fixtures/claude-code-request.json` and `src/adapters/adapters.test.ts` | Isolated `HOME`/`CLAUDE_CONFIG_DIR`, `--bare --strict-mcp-config --mcp-config … --print ping`, and loopback `POST /v1/messages?beta=true` | Flat MCP entries carried `description` and `input_schema` with no output surface. Against the bundled fixture, root `anyOf` branches were flattened into properties, and the descriptions of the two root-union tools, `union_modes` and `branch_only_fields`, were replaced by an `Input constraint: Provide parameters for at least one of: …` summary (recorded as two `rewritten` description changes). The other exercised descriptions, types, required names, nested schemas, and constraints survived. |
+| 2026-09-26 | Claude Code 2.1.283 | Opt-in lane in `tests/e2e.test.ts` against the installed client, plus a local capture of one long-description tool; no new frozen fixture | Same as 2.1.231 | The bundled fixture rendered as on 2.1.231: all six tools, root `anyOf` flattened, and the two root-union descriptions replaced. A 4,712-character tool description was cut to its first 2,048 characters with `… [truncated]` appended, recorded as a `truncated` description change; a 4,716-character property description survived whole. |
 
 ## Pending captures
 
