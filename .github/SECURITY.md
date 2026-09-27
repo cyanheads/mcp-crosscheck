@@ -22,4 +22,4 @@ Include a minimal reproduction where possible. You'll receive an acknowledgment 
 
 Treat all of it as local-sensitive. Do not attach raw artifacts to issues, and redact credentials before pasting any output.
 
-Header values passed with `--header` are removed from crosscheck-owned diagnostics and reports. They are **not** removed from raw captures or from server echoes, and the command line itself can be visible through shell history or process inspection — Inspector and mcpo also receive headers in child-process arguments. Use dummy credentials against test servers where you can.
+Header values passed with `--header` are redacted by exact match from the free text of crosscheck-owned diagnostics and reports: finding details, status and canary details, progress lines, and error messages. They are **not** redacted from structured fields (rule ids, paths, evidence, tool and server names, the target, versions), raw captures, or server echoes, and the command line itself can be visible through shell history or process inspection — Inspector and mcpo also receive headers in child-process arguments. Use dummy credentials against test servers where you can.
