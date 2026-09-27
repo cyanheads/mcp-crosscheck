@@ -1,6 +1,6 @@
 {
   "name": "mcp-crosscheck",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Run real MCP clients against your server and diff their rendered tool surface against tools/list. Deterministic — no LLM calls.",
   "type": "module",
   "bin": {
