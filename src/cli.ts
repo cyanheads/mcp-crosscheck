@@ -70,13 +70,17 @@ const OPTIONS = {
 } as const satisfies ParseArgsOptionsConfig;
 
 /**
- * Whether this run answers in JSON. A lenient parse of the same option table
- * decides, so a flag-parse error still answers in JSON when `--json` was given
- * in any form; a `--json` after the `--` terminator belongs to the server command.
+ * Whether this run answers in JSON: a `--json` token, in any form, before the
+ * `--` terminator. A raw scan decides rather than a parse, so a flag-parse
+ * error still answers in JSON, even a string flag missing its value right
+ * before `--json` — a lenient parse would read `--json` as that value, which
+ * the strict parse never accepts. A `--json` after `--` belongs to the server command.
  */
 function jsonRequested(args: string[]): boolean {
-  const { values } = parseArgs({ allowPositionals: true, args, options: OPTIONS, strict: false });
-  return values.json !== undefined;
+  const end = args.indexOf('--');
+  return (end === -1 ? args : args.slice(0, end)).some(
+    (arg) => arg === '--json' || arg.startsWith('--json='),
+  );
 }
 
 /** Strict flag parse. An unknown flag, a missing value, or a value on a switch is a usage error. */

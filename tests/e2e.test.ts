@@ -1532,6 +1532,9 @@ describe('CLI process lane', () => {
         ['--json', '--adpaters', 'inspector', ...STDIO],
         ['--adapters', 'inspector', '--json', '--timeout'],
         ['--json=yes', ...STDIO],
+        // A string flag missing its value right before --json.
+        ['--timeout', '--json', ...STDIO],
+        ['--baseline', '--json', ...STDIO],
       ]) {
         const result = await runCli(args);
         expect(result.code).toBe(2);
