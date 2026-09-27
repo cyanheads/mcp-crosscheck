@@ -28,7 +28,7 @@ CROSSCHECK_E2E_CLAUDE_CODE=1 bun test tests/e2e.test.ts
 ```
 
 - `CROSSCHECK_E2E_NETWORK` exercises Inspector and mcpo at their resolved releases; mcpo requires `uv` on `PATH`.
-- `CROSSCHECK_E2E_CODEX` exercises the installed Codex CLI through its local provider intercept.
+- `CROSSCHECK_E2E_CODEX` exercises Codex CLI at its resolved release (`npx -y @openai/codex`) through its local provider intercept.
 - `CROSSCHECK_E2E_CLAUDE_CODE` exercises the installed Claude Code client through its local base-URL intercept.
 
 ## Project constraints

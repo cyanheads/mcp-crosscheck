@@ -1,0 +1,81 @@
+name: Feature request
+description: Propose a new capability or an improvement to an existing one
+title: "feat: "
+labels:
+  - enhancement
+assignees:
+  - cyanheads
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For a new client capture adapter, use the **Adapter request** form instead — it collects the capture-boundary details this form does not.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Invariant engine and schema comparison
+        - Client adapter behavior
+        - CLI, flags, and reporting
+        - Baselines
+        - Documentation
+    validations:
+      required: true
+  - type: textarea
+    id: gap
+    attributes:
+      label: Gap
+      description: What mcp-crosscheck cannot do today, and what that costs someone testing a server. Name the rule, adapter, flag, or path.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: The behavior you want, concretely. Show the flag, finding, or report shape it would produce.
+    validations:
+      required: true
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Proposed severity tier
+      description: A new or changed invariant lands in one of these. `fail` breaks a consumer's build; `info` never does. Choose "not a finding change" for CLI, reporting, or documentation work.
+      options:
+        - Not a finding change
+        - info — recorded degradation, never fails a run
+        - fail — divergence that breaks agents in the wild
+    validations:
+      required: true
+  - type: dropdown
+    id: compatibility
+    attributes:
+      label: Compatibility impact
+      description: Changing finding evidence changes persisted baseline identities and invalidates existing baseline files.
+      options:
+        - No change to findings, evidence, or report shape
+        - Adds a new rule or evidence variant
+        - Changes existing evidence, report shape, or a severity tier
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and out of scope
+      description: Which modules and tests this touches, and what it deliberately does not do.
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What you tried or evaluated instead, and why it fell short.
+    validations:
+      required: false
+  - type: checkboxes
+    id: determinism
+    attributes:
+      label: Determinism
+      options:
+        - label: The proposal needs no model inference, account, token, or non-loopback provider traffic.
+          required: true
