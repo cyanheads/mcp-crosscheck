@@ -9,7 +9,8 @@ import type { CanaryOutcome, Finding, RunReport } from './types.js';
 
 type Redact = (text: string) => string;
 
-const REDACTED = '[REDACTED]';
+/** The marker that replaces each header value. */
+export const REDACTED = '[REDACTED]';
 const reportRedactors = new WeakMap<object, Redact>();
 
 /**

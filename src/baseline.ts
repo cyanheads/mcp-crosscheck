@@ -5,6 +5,7 @@
 import { randomUUID } from 'node:crypto';
 import { rename, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
+import { REDACTED } from './redact.js';
 import { CONSTRAINT_KEYWORDS, isRecord } from './schema.js';
 import type {
   AdapterName,
@@ -102,9 +103,21 @@ function nullableString(value: unknown): value is string | null {
 }
 
 /**
+ * 0.1.0 redacted header values inside evidence as well as prose, so a baseline
+ * it wrote can carry the marker in a constraint keyword, or in both types of a
+ * retyping it reduced to `from === to`. Such an entry still parses and
+ * reconciles as stale instead of failing the whole file.
+ */
+function isLegacyRedacted(value: string): boolean {
+  return value.includes(REDACTED);
+}
+
+/**
  * Validate one evidence object against exactly the values the engine can emit,
  * so an entry that could never match a finding is rejected rather than left
  * stale. Server-authored strings (a type, a required name) may be empty.
+ * Entries an earlier version wrote are the exception: untyped ground truth and
+ * header-redacted keywords and types parse, and reconcile as stale.
  */
 function parseEvidence(value: unknown): BaselineEvidence {
   if (!isRecord(value) || typeof value.kind !== 'string') {
@@ -150,7 +163,7 @@ function parseEvidence(value: unknown): BaselineEvidence {
         hasExactKeys(value, ['from', 'kind', 'to']) &&
         typeof value.from === 'string' &&
         typeof value.to === 'string' &&
-        value.from !== value.to
+        (value.from !== value.to || isLegacyRedacted(value.from))
       ) {
         return value as BaselineEvidence;
       }
@@ -176,7 +189,10 @@ function parseEvidence(value: unknown): BaselineEvidence {
     case 'constraint-dropped':
       if (
         hasExactKeys(value, ['keywords', 'kind']) &&
-        isCanonicalSet(value.keywords, (keyword) => CONSTRAINT_KEYWORD_SET.has(keyword))
+        isCanonicalSet(
+          value.keywords,
+          (keyword) => CONSTRAINT_KEYWORD_SET.has(keyword) || isLegacyRedacted(keyword),
+        )
       ) {
         return value as BaselineEvidence;
       }

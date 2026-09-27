@@ -445,6 +445,41 @@ describe('baseline reconciliation and updates', () => {
     ]);
   });
 
+  test('entries a 0.1.0 header-redacted run wrote still parse and reconcile as stale', () => {
+    // 0.1.0 redacted evidence too: `Accept-Language: en` rewrote maxLength, and
+    // header values `integer` and `number` reduced a retyping to from === to.
+    const legacy = parseBaseline(
+      JSON.stringify({
+        baselineVersion: 1,
+        entries: [
+          {
+            adapter: 'codex',
+            evidence: {
+              keywords: ['maxL[REDACTED]gth', 'minL[REDACTED]gth'],
+              kind: 'constraint-dropped',
+            },
+            path: 'echo.message',
+            rule: 'constraint-dropped',
+          },
+          {
+            adapter: 'codex',
+            evidence: { from: '[REDACTED]', kind: 'property-retyped', to: '[REDACTED]' },
+            path: 'echo.count',
+            rule: 'property-retyped',
+          },
+        ],
+      }),
+    );
+    expect(parseBaseline(serializeBaseline(legacy))).toEqual(legacy);
+    const result = reconcileBaseline(legacy, [
+      { adapter: 'codex', comparisonSucceeded: true, findings: [constraintFinding] },
+    ]);
+    expect(result.adapters[0]?.newFindings).toEqual([constraintFinding]);
+    expect(result.baselineDiagnostics.map((diagnostic) => diagnostic.entry)).toEqual(
+      legacy.entries,
+    );
+  });
+
   test('unselected and failed adapters are preserved and never stale', () => {
     const baseline = { baselineVersion: 1 as const, entries: [entry] };
     expect(reconcileBaseline(baseline, []).baselineDiagnostics).toEqual([]);
