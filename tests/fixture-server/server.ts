@@ -13,6 +13,11 @@
  * `MCP_FIXTURE_TOOLS`, a JSON tool array, replaces the advertised tools for a
  * test that needs a surface the fixture does not carry.
  *
+ * `MCP_FIXTURE_PROBE_PATH=<file>` appends one JSON line to the file each time
+ * the server starts: its environment variable names, `HOME`, its working
+ * directory, and the arguments after the script. Every launch path a test
+ * compares records one line, so parity is a line-by-line equality.
+ *
  * Switches that misbehave on purpose, all off by default:
  *   MCP_FIXTURE_PAGE_SIZE=<n>        page `tools/list` n tools at a time
  *   MCP_FIXTURE_CURSOR=repeat        answer every page with the same `nextCursor`
@@ -20,8 +25,13 @@
  *   MCP_FIXTURE_INVALID_OUTPUT=mismatch|missing
  *                                    `nested_config` answers with `structuredContent`
  *                                    that violates its `outputSchema`, or with none
+ *   MCP_FIXTURE_CALL_ERROR=<text>    answer every `tools/call` with `isError` and <text>
+ *   MCP_FIXTURE_STDERR_BYTES=<n>     write n bytes to stderr before serving, blocking
+ *                                    while the pipe is full, as a synchronous logger does
+ *   MCP_FIXTURE_FATAL=<text>         then write <text> to stderr and exit 1 before serving
  */
 import { randomUUID } from 'node:crypto';
+import { writeSync } from 'node:fs';
 import { appendFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 
@@ -57,6 +67,7 @@ const PAGE_SIZE = Math.max(
 );
 const CURSOR_MODE = process.env.MCP_FIXTURE_CURSOR;
 const INVALID_OUTPUT = process.env.MCP_FIXTURE_INVALID_OUTPUT;
+const CALL_ERROR = process.env.MCP_FIXTURE_CALL_ERROR;
 
 /**
  * The page a cursor names. Well-behaved cursors are `page-<index>`; `repeat`
@@ -110,6 +121,9 @@ function createFixtureServer(): Server {
     const { arguments: args, name } = request.params;
     if (!ADVERTISED_TOOLS.some((tool) => tool.name === name)) {
       return { content: [{ text: `unknown tool: ${name}`, type: 'text' }], isError: true };
+    }
+    if (CALL_ERROR !== undefined) {
+      return { content: [{ text: CALL_ERROR, type: 'text' }], isError: true };
     }
     const structuredContent = structuredResultFor(name);
     return {
@@ -200,6 +214,23 @@ async function handleHttpRequest(request: IncomingMessage, response: ServerRespo
   }
   await transport.handleRequest(request, response, body);
   if (request.method === 'DELETE' && typeof sessionId === 'string') transports.delete(sessionId);
+}
+
+const probePath = process.env.MCP_FIXTURE_PROBE_PATH;
+if (probePath !== undefined) {
+  const probe = {
+    argv: process.argv.slice(2),
+    cwd: process.cwd(),
+    envNames: Object.keys(process.env).sort(),
+    home: process.env.HOME ?? null,
+  };
+  await appendFile(probePath, `${JSON.stringify(probe)}\n`);
+}
+const stderrBytes = Number(process.env.MCP_FIXTURE_STDERR_BYTES ?? 0);
+if (stderrBytes > 0) writeSync(2, `${'x'.repeat(stderrBytes - 1)}\n`);
+if (process.env.MCP_FIXTURE_FATAL !== undefined) {
+  writeSync(2, `${process.env.MCP_FIXTURE_FATAL}\n`);
+  process.exit(1);
 }
 
 if (process.env.MCP_TRANSPORT_TYPE === 'http') {

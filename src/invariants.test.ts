@@ -9,11 +9,13 @@ import { join } from 'node:path';
 import { z } from 'zod';
 
 import { FIXTURE_TOOLS } from '../tests/fixture-server/tools.js';
+import { baselineEntryFromFinding } from './baseline.js';
 import {
   buildFindings,
   compareSurface,
   depthLimitedPaths,
   groundTruthFindings,
+  pairEmptyCapture,
 } from './invariants.js';
 import { renderedPropertiesFromJsonSchema, renderedToolFromJsonSchema } from './schema.js';
 import type {
@@ -22,6 +24,9 @@ import type {
   GroundTruth,
   GroundTruthTool,
   RenderedSurface,
+  RenderedTool,
+  ToolRename,
+  ToolRenameMap,
 } from './types.js';
 
 /** A captured SDK v1 `McpServer` surface: draft-07 `$schema` on every input schema. */
@@ -2649,6 +2654,420 @@ describe('buildFindings', () => {
       surface: faithful,
     };
     expect(buildFindings([gtTool], result)).toEqual([]);
+  });
+
+  test('capture-failure is its own single fail finding, never a handshake failure', () => {
+    const result: AdapterRunResult = {
+      ...base,
+      adapter: 'inspector',
+      resolvedVersion: '2.3.0',
+      status: 'capture-failure',
+      statusDetail: 'tools/list output did not parse (98789 bytes)',
+      surface: null,
+    };
+    for (const groundTruth of [[gtTool], []]) {
+      expect(buildFindings(groundTruth, result)).toEqual([
+        {
+          detail:
+            'client output could not be captured — tools/list output did not parse (98789 bytes)',
+          evidence: { kind: 'capture-failure' },
+          path: null,
+          rule: 'capture-failure',
+          severity: 'fail',
+        },
+      ]);
+    }
+    expect(buildFindings([gtTool], { ...result, statusDetail: null })[0]?.detail).toBe(
+      'client output could not be captured',
+    );
+  });
+});
+
+describe('empty capture pairing', () => {
+  /** The detail each capture-only adapter has always reported for a capture with no MCP tools. */
+  const NO_MCP_TOOLS = {
+    'claude-code':
+      'tools-bearing model request captured but it carried no MCP tools for the configured target',
+    codex:
+      'model request captured but it carried no MCP tools — the server may have failed to start under codex',
+  } as const;
+
+  /** An adapter's `ok` result for a capture that carried no MCP tools. */
+  const emptyCapture = (adapter: keyof typeof NO_MCP_TOOLS): AdapterRunResult => ({
+    adapter,
+    canary: { attempted: false, detail: `${adapter} adapter is capture-only`, ok: null },
+    durationMs: 7,
+    emptyCapture: { detail: NO_MCP_TOOLS[adapter] },
+    resolvedVersion: '1.0.0',
+    status: 'ok',
+    statusDetail: null,
+    surface: { tools: [] },
+  });
+
+  const second: GroundTruthTool = { ...gtTool, name: 'second' };
+  const base = { adapter: 'mcpo', canary: null, durationMs: 1, resolvedVersion: '0.0.20' } as const;
+
+  test('against a server that advertises tools, buildFindings reports one handshake-failure, never acknowledgeable tool-missing entries', () => {
+    for (const adapter of ['claude-code', 'codex'] as const) {
+      const findings = buildFindings([gtTool, second], emptyCapture(adapter));
+      expect(findings).toEqual([
+        {
+          detail: `client could not complete the MCP handshake — ${NO_MCP_TOOLS[adapter]}`,
+          evidence: { kind: 'handshake-failure' },
+          path: null,
+          rule: 'handshake-failure',
+          severity: 'fail',
+        },
+      ]);
+      expect(findings.map((finding) => baselineEntryFromFinding(adapter, finding))).toEqual([null]);
+    }
+  });
+
+  test('against a server that advertises none, an empty capture compares clean', () => {
+    for (const adapter of ['claude-code', 'codex'] as const) {
+      expect(buildFindings([], emptyCapture(adapter))).toEqual([]);
+    }
+  });
+
+  test('pairing turns the marked result into the historical handshake failure only when ground truth lists a tool', () => {
+    for (const adapter of ['claude-code', 'codex'] as const) {
+      const marked = emptyCapture(adapter);
+      const historical: AdapterRunResult = {
+        adapter,
+        canary: null,
+        durationMs: 7,
+        resolvedVersion: '1.0.0',
+        status: 'handshake-failure',
+        statusDetail: NO_MCP_TOOLS[adapter],
+        surface: null,
+      };
+      expect(pairEmptyCapture([gtTool], marked)).toEqual(historical);
+      expect(pairEmptyCapture([gtTool, second], marked)).toEqual(historical);
+      // Applying it twice changes nothing, so a caller may pair before buildFindings does.
+      expect(pairEmptyCapture([gtTool], pairEmptyCapture([gtTool], marked))).toEqual(historical);
+      expect(pairEmptyCapture([], marked)).toBe(marked);
+    }
+  });
+
+  test('a client that drops every advertised tool sends none, so its empty capture compares as those drops', () => {
+    const drops: ToolRenameMap = new Map([
+      ['echo', { kind: 'dropped', reason: 'its rendered name is 129 characters' }],
+      ['second', { kind: 'dropped', reason: '"echo", listed before it, renders alike' }],
+    ]);
+    for (const adapter of ['claude-code', 'codex'] as const) {
+      const marked = emptyCapture(adapter);
+      expect(pairEmptyCapture([gtTool, second], marked, drops)).toBe(marked);
+      expect(buildFindings([gtTool, second], marked, drops)).toEqual([
+        {
+          detail:
+            'tool is missing from the rendered surface — the client drops it: its rendered name is 129 characters',
+          evidence: { kind: 'tool-missing' },
+          path: 'echo',
+          rule: 'tool-missing',
+          severity: 'fail',
+        },
+        {
+          detail:
+            'tool is missing from the rendered surface — the client drops it: "echo", listed before it, renders alike',
+          evidence: { kind: 'tool-missing' },
+          path: 'second',
+          rule: 'tool-missing',
+          severity: 'fail',
+        },
+      ]);
+      // A tool the client would still send makes the empty capture a failed handshake again.
+      const oneDropped: ToolRenameMap = new Map([['echo', drops.get('echo') as ToolRename]]);
+      expect(pairEmptyCapture([gtTool, second], marked, oneDropped).status).toBe(
+        'handshake-failure',
+      );
+    }
+  });
+
+  test('pairing leaves every unmarked result as it is', () => {
+    const results: AdapterRunResult[] = [
+      { ...base, status: 'ok', statusDetail: null, surface: { tools: [] } },
+      { ...base, status: 'ok', statusDetail: null, surface: faithful },
+      { ...base, status: 'handshake-failure', statusDetail: 'timed out', surface: null },
+      { ...base, status: 'adapter-broken', statusDetail: 'exit code 1', surface: null },
+      {
+        ...base,
+        status: 'capture-failure',
+        statusDetail: 'did not parse (3 bytes)',
+        surface: null,
+      },
+    ];
+    for (const groundTruth of [[], [gtTool]]) {
+      for (const result of results) expect(pairEmptyCapture(groundTruth, result)).toBe(result);
+    }
+  });
+
+  test('a timeout, an early exit, and an unmarked empty surface keep their classification whatever ground truth lists', () => {
+    const results: AdapterRunResult[] = [
+      {
+        ...base,
+        adapter: 'codex',
+        status: 'handshake-failure',
+        statusDetail: 'no model request captured within 5000ms',
+        surface: null,
+      },
+      {
+        ...base,
+        adapter: 'claude-code',
+        status: 'adapter-broken',
+        statusDetail: 'claude exited before issuing a tools-bearing model request — exit code 1',
+        surface: null,
+      },
+    ];
+    for (const groundTruth of [[], [gtTool]]) {
+      expect(results.map((result) => buildFindings(groundTruth, result)[0]?.rule)).toEqual([
+        'handshake-failure',
+        'adapter-broken',
+      ]);
+    }
+    // An inspector or mcpo surface with no tools is a capture, not an empty-capture marker.
+    const unmarked: AdapterRunResult = {
+      ...base,
+      status: 'ok',
+      statusDetail: null,
+      surface: { tools: [] },
+    };
+    expect(buildFindings([], unmarked)).toEqual([]);
+    expect(buildFindings([gtTool], unmarked).map((finding) => finding.rule)).toEqual([
+      'tool-missing',
+    ]);
+  });
+});
+
+describe('tool renames', () => {
+  const object = (properties: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({
+    properties,
+    type: 'object',
+    ...extra,
+  });
+  const filesRead: GroundTruthTool = {
+    description: 'Read files.',
+    inputSchema: object(
+      {
+        options: object(
+          { encoding: { enum: ['base64', 'utf8'], type: 'string' } },
+          { required: ['encoding'] },
+        ),
+        paths: { items: { maxLength: 4096, type: 'string' }, type: 'array' },
+      },
+      { required: ['paths'] },
+    ),
+    name: 'files.read',
+    outputSchema: object({
+      entries: { items: object({ size: { type: 'integer' } }), type: 'array' },
+    }),
+  };
+  const getWeather: GroundTruthTool = {
+    description: 'Get the weather.',
+    inputSchema: object({ city: { type: 'string' } }),
+    name: 'get-weather',
+  };
+  /** A second tool whose name `files.read` collides with once sanitized. */
+  const filesUnderscore: GroundTruthTool = {
+    description: 'Read files, underscored.',
+    inputSchema: object({ path: { type: 'string' } }),
+    name: 'files_read',
+  };
+
+  /** A tool rendered under `name`, verbatim unless a schema is replaced. */
+  function renderedAs(
+    tool: GroundTruthTool,
+    name: string,
+    schemas: { input?: Record<string, unknown>; output?: Record<string, unknown> } = {},
+  ): RenderedTool {
+    const rendered = renderedToolFromJsonSchema(
+      name,
+      tool.description,
+      schemas.input ?? tool.inputSchema,
+    );
+    const output = schemas.output ?? tool.outputSchema;
+    if (output !== undefined) rendered.outputProperties = renderedPropertiesFromJsonSchema(output);
+    return rendered;
+  }
+
+  const sanitized = (rendered: string) =>
+    ({ change: 'sanitized', kind: 'renamed', rendered }) as const;
+  const hashed = (rendered: string) => ({ change: 'hashed', kind: 'renamed', rendered }) as const;
+
+  /** The `tool-renamed` finding the engine reports for one renamed tool. */
+  const renamedFinding = (
+    path: string,
+    change: 'hashed' | 'sanitized',
+    rendered: string,
+  ): Finding => ({
+    detail: `tool name was ${change} in rendering — the client renders it as "${rendered}"`,
+    evidence: { change, kind: 'tool-renamed' },
+    path,
+    rule: 'tool-renamed',
+    severity: 'info',
+  });
+
+  const surface = {
+    tools: [renderedAs(filesRead, 'files_read'), renderedAs(getWeather, 'get-weather')],
+  };
+
+  test('without a map, or with an empty one, a tool rendered under another name is tool-missing as before', () => {
+    const missing: Finding[] = [
+      {
+        detail: 'tool is missing from the rendered surface',
+        evidence: { kind: 'tool-missing' },
+        path: 'files.read',
+        rule: 'tool-missing',
+        severity: 'fail',
+      },
+    ];
+    expect(compareSurface([filesRead, getWeather], surface)).toEqual(missing);
+    expect(compareSurface([filesRead, getWeather], surface, new Map())).toEqual(missing);
+  });
+
+  test('a renamed tool is one info finding at its advertised path; unmapped names match as advertised', () => {
+    const renames: ToolRenameMap = new Map([
+      ['files.read', sanitized('files_read')],
+      ['not-advertised', sanitized('not_advertised')],
+    ]);
+    expect(compareSurface([filesRead, getWeather], surface, renames)).toEqual([
+      renamedFinding('files.read', 'sanitized', 'files_read'),
+    ]);
+  });
+
+  test('divergence below a renamed tool reports under the advertised name, past the first level and in output', () => {
+    const renames: ToolRenameMap = new Map([['files.read', sanitized('files_read')]]);
+    const degraded = renderedAs(filesRead, 'files_read', {
+      input: object(
+        {
+          options: object({ encoding: { enum: ['base64', 'utf8'], type: 'string' } }),
+          paths: { items: { type: 'string' }, type: 'array' },
+        },
+        { required: ['paths'] },
+      ),
+      output: object({ entries: { items: object({ size: {} }), type: 'array' } }),
+    });
+    expect(
+      compareSurface([filesRead], { tools: [degraded] }, renames).map((finding) => [
+        finding.rule,
+        finding.path,
+        finding.evidence,
+      ]),
+    ).toEqual([
+      ['tool-renamed', 'files.read', { change: 'sanitized', kind: 'tool-renamed' }],
+      ['required-dropped', 'files.read.options', { kind: 'required-dropped', names: ['encoding'] }],
+      [
+        'constraint-dropped',
+        'files.read.paths[]',
+        { keywords: ['maxLength'], kind: 'constraint-dropped' },
+      ],
+      [
+        'output-schema-divergence',
+        'output:files.read.entries[].size',
+        { groundTruthType: 'integer', kind: 'output-field-untyped' },
+      ],
+    ]);
+  });
+
+  test('a mapped tool absent from the capture is tool-missing naming the name it was expected under', () => {
+    const renames: ToolRenameMap = new Map([['files.read', hashed('files_read_a5853431b20f')]]);
+    // The capture holds the plain sanitized name: the client's rule changed, and nothing matches it.
+    expect(compareSurface([filesRead], surface, renames)).toEqual([
+      {
+        detail:
+          'tool is missing from the rendered surface under its expected hashed name "files_read_a5853431b20f"',
+        evidence: { kind: 'tool-missing' },
+        path: 'files.read',
+        rule: 'tool-missing',
+        severity: 'fail',
+      },
+    ]);
+  });
+
+  test('a dropped tool is tool-missing with the client’s reason, even when its advertised name was captured', () => {
+    const collision = 'its sanitized name files_read collides with files.read, listed first';
+    // `files.read` listed first: its rendering takes `files_read`, and the real `files_read` is dropped.
+    const firstWins: ToolRenameMap = new Map<string, ToolRename>([
+      ['files.read', sanitized('files_read')],
+      ['files_read', { kind: 'dropped', reason: collision }],
+    ]);
+    expect(
+      compareSurface(
+        [filesRead, filesUnderscore],
+        { tools: [renderedAs(filesRead, 'files_read')] },
+        firstWins,
+      ),
+    ).toEqual([
+      renamedFinding('files.read', 'sanitized', 'files_read'),
+      {
+        detail: `tool is missing from the rendered surface — the client drops it: ${collision}`,
+        evidence: { kind: 'tool-missing' },
+        path: 'files_read',
+        rule: 'tool-missing',
+        severity: 'fail',
+      },
+    ]);
+    // Listed the other way round, `files_read` renders as itself and `files.read` is the one dropped.
+    const swapped: ToolRenameMap = new Map([
+      ['files.read', { kind: 'dropped', reason: 'its sanitized name collides with files_read' }],
+    ]);
+    expect(
+      compareSurface(
+        [filesUnderscore, filesRead],
+        { tools: [renderedAs(filesUnderscore, 'files_read')] },
+        swapped,
+      ).map((finding) => [finding.rule, finding.path, finding.detail]),
+    ).toEqual([
+      [
+        'tool-missing',
+        'files.read',
+        'tool is missing from the rendered surface — the client drops it: its sanitized name collides with files_read',
+      ],
+    ]);
+  });
+
+  test('every member of a hashed collision group compares against its own rendering', () => {
+    const renames: ToolRenameMap = new Map([
+      ['files.read', hashed('files_read_a5853431b20f')],
+      ['files_read', hashed('files_read_2505a6bf744b')],
+    ]);
+    const tools = [
+      renderedAs(filesUnderscore, 'files_read_2505a6bf744b', { input: object({ path: {} }) }),
+      renderedAs(filesRead, 'files_read_a5853431b20f'),
+    ];
+    expect(
+      compareSurface([filesRead, filesUnderscore], { tools }, renames).map((finding) => [
+        finding.rule,
+        finding.path,
+        finding.evidence,
+      ]),
+    ).toEqual([
+      ['tool-renamed', 'files.read', { change: 'hashed', kind: 'tool-renamed' }],
+      ['tool-renamed', 'files_read', { change: 'hashed', kind: 'tool-renamed' }],
+      [
+        'property-untyped',
+        'files_read.path',
+        { groundTruthType: 'string', kind: 'property-untyped' },
+      ],
+    ]);
+  });
+
+  test('buildFindings passes the map to the comparison and keeps the canary check', () => {
+    const result: AdapterRunResult = {
+      adapter: 'claude-code',
+      canary: { attempted: false, detail: 'claude-code adapter is capture-only', ok: null },
+      durationMs: 1,
+      resolvedVersion: '2.1.325',
+      status: 'ok',
+      statusDetail: null,
+      surface,
+    };
+    const renames: ToolRenameMap = new Map([['files.read', sanitized('files_read')]]);
+    expect(buildFindings([filesRead, getWeather], result, renames)).toEqual([
+      renamedFinding('files.read', 'sanitized', 'files_read'),
+    ]);
+    expect(buildFindings([filesRead, getWeather], result).map((finding) => finding.rule)).toEqual([
+      'tool-missing',
+    ]);
   });
 });
 

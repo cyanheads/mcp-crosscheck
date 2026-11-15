@@ -15,19 +15,27 @@ import type {
   BaselineEntry,
   BaselineEvidence,
   Finding,
+  FindingEvidence,
   GroundTruthRuleId,
-  RuleId,
+  RuntimeRuleId,
 } from './types.js';
 import { canonicalize, canonicalJson } from './util/canonical-json.js';
 
 const ADAPTERS = new Set<AdapterName>(['claude-code', 'codex', 'inspector', 'mcpo']);
 
-/** Rules describing a failed run rather than a rendered surface — never baselineable. */
-export const RUNTIME_RULES: ReadonlySet<string> = new Set<RuleId>([
-  'adapter-broken',
-  'canary-failed',
-  'handshake-failure',
-]);
+/**
+ * Rules describing a failed run rather than a rendered surface — never
+ * baselineable, and a run that reports one never rewrites a baseline. Keyed by
+ * `RuntimeRuleId`, so a new runtime rule does not typecheck until it is listed here.
+ */
+export const RUNTIME_RULES: ReadonlySet<string> = new Set(
+  Object.keys({
+    'adapter-broken': true,
+    'canary-failed': true,
+    'capture-failure': true,
+    'handshake-failure': true,
+  } satisfies Record<RuntimeRuleId, true>),
+);
 /**
  * Rules describing the advertised surface itself, reported under
  * `groundTruth.findings` — never baselineable. Keyed by `GroundTruthRuleId`,
@@ -39,6 +47,16 @@ const GROUND_TRUTH_RULES: ReadonlySet<string> = new Set(
     'unsupported-dialect': true,
   } satisfies Record<GroundTruthRuleId, true>),
 );
+
+/**
+ * Whether a baseline can hold this evidence. Runtime and ground-truth evidence
+ * kinds equal their rule ids, so the two exhaustive sets above are exactly the
+ * kinds `BaselineEvidence` excludes.
+ */
+function isBaselineEvidence(evidence: FindingEvidence): evidence is BaselineEvidence {
+  return !RUNTIME_RULES.has(evidence.kind) && !GROUND_TRUTH_RULES.has(evidence.kind);
+}
+
 const RULE_FOR_KIND: Record<BaselineEvidence['kind'], BaselineableRuleId> = {
   'anyof-ignored': 'anyof-ignored',
   'constraint-altered': 'constraint-altered',
@@ -57,6 +75,7 @@ const RULE_FOR_KIND: Record<BaselineEvidence['kind'], BaselineableRuleId> = {
   'property-untyped': 'property-untyped',
   'required-dropped': 'required-dropped',
   'tool-missing': 'tool-missing',
+  'tool-renamed': 'tool-renamed',
 };
 
 /** An actionable baseline document error; callers expose it as a usage error. */
@@ -172,6 +191,14 @@ function parseEvidence(value: unknown): BaselineEvidence {
       if (
         hasExactKeys(value, ['kind', 'subject']) &&
         (value.subject === 'tool' || value.subject === 'property')
+      ) {
+        return value as BaselineEvidence;
+      }
+      break;
+    case 'tool-renamed':
+      if (
+        hasExactKeys(value, ['change', 'kind']) &&
+        (value.change === 'hashed' || value.change === 'sanitized')
       ) {
         return value as BaselineEvidence;
       }
@@ -341,16 +368,7 @@ export function baselineEntryFromFinding(
   adapter: AdapterName,
   finding: Finding,
 ): BaselineEntry | null {
-  if (
-    finding.path === null ||
-    finding.evidence.kind === 'adapter-broken' ||
-    finding.evidence.kind === 'canary-failed' ||
-    finding.evidence.kind === 'handshake-failure' ||
-    finding.evidence.kind === 'sdk-v1-rejected' ||
-    finding.evidence.kind === 'unsupported-dialect'
-  ) {
-    return null;
-  }
+  if (finding.path === null || !isBaselineEvidence(finding.evidence)) return null;
   return {
     adapter,
     evidence: canonicalEvidence(finding.evidence),

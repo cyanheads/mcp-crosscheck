@@ -14,6 +14,16 @@ export type TargetSpec =
   | { kind: 'stdio'; command: string; args: string[]; env: Record<string, string> }
   | { kind: 'http'; headers?: Record<string, string>; url: string };
 
+/**
+ * The target as an adapter receives it. A stdio target is a command line only:
+ * it starts the launcher (`src/launch-target.ts`), which applies the target's
+ * environment and working directory exactly as ground truth does, so no client
+ * configuration carries them.
+ */
+export type AdapterTarget =
+  | { kind: 'stdio'; command: string; args: string[] }
+  | Extract<TargetSpec, { kind: 'http' }>;
+
 /** A safe tool to round-trip through each adapter, with exact arguments. Never synthesized. */
 export interface CanarySpec {
   args: Record<string, unknown>;
@@ -126,6 +136,7 @@ export type RuleId =
   | 'adapter-broken'
   | 'anyof-ignored'
   | 'canary-failed'
+  | 'capture-failure'
   | 'constraint-altered'
   | 'constraint-dropped'
   | 'description-altered'
@@ -140,7 +151,19 @@ export type RuleId =
   | 'required-dropped'
   | 'sdk-v1-rejected'
   | 'tool-missing'
+  | 'tool-renamed'
   | 'unsupported-dialect';
+
+/**
+ * Rules that describe a failed run rather than a rendered surface: always
+ * `fail`, never scoped to a path, never baselined, and a run that hits one
+ * leaves its baseline file untouched. Each one's evidence kind is its rule id.
+ */
+export type RuntimeRuleId =
+  | 'adapter-broken'
+  | 'canary-failed'
+  | 'capture-failure'
+  | 'handshake-failure';
 
 /**
  * Rules that describe the advertised surface itself rather than a client's
@@ -149,11 +172,20 @@ export type RuleId =
  */
 export type GroundTruthRuleId = 'sdk-v1-rejected' | 'unsupported-dialect';
 
+/**
+ * How a client rewrote a tool name. `sanitized`: characters the client does
+ * not allow in a name were replaced or removed. `hashed`: the client added a
+ * hash suffix, for a name that collides with another or would exceed its
+ * length limit.
+ */
+export type ToolRenameChange = 'hashed' | 'sanitized';
+
 /** Stable machine facts carried by a finding; human `detail` is never an identity source. */
 export type FindingEvidence =
   | { kind: 'adapter-broken' }
   | { kind: 'anyof-ignored' }
   | { kind: 'canary-failed' }
+  | { kind: 'capture-failure' }
   | { keywords: string[]; kind: 'constraint-altered' }
   | { keywords: string[]; kind: 'constraint-dropped' }
   | { change: 'rewritten' | 'truncated'; kind: 'description-altered'; subject: 'property' | 'tool' }
@@ -171,6 +203,7 @@ export type FindingEvidence =
   | { from: string; kind: 'property-retyped'; to: string }
   | { kind: 'required-dropped'; names: string[] }
   | { kind: 'tool-missing' }
+  | { change: ToolRenameChange; kind: 'tool-renamed' }
   | { kind: 'output-field-missing' }
   | { groundTruthType: string | null; kind: 'output-field-untyped' }
   | { from: string; kind: 'output-field-retyped'; to: string }
@@ -182,14 +215,11 @@ export type FindingEvidence =
 /** Rendering-only evidence accepted by a compatibility baseline. */
 export type BaselineEvidence = Exclude<
   FindingEvidence,
-  { kind: 'adapter-broken' | 'canary-failed' | 'handshake-failure' | GroundTruthRuleId }
+  { kind: RuntimeRuleId | GroundTruthRuleId }
 >;
 
 /** Rules that describe a rendered surface and may be acknowledged in a baseline. */
-export type BaselineableRuleId = Exclude<
-  RuleId,
-  'adapter-broken' | 'canary-failed' | 'handshake-failure' | GroundTruthRuleId
->;
+export type BaselineableRuleId = Exclude<RuleId, RuntimeRuleId | GroundTruthRuleId>;
 
 /** One divergence between ground truth and a rendered surface. */
 export interface Finding {
@@ -231,15 +261,22 @@ export interface AdapterContext {
   /** Process-execution seam; omitted means real child processes. */
   exec?: Exec;
   log: (line: string) => void;
-  /** Extra `uvx --with` dependency constraints for the mcpo adapter (e.g. `mcp<2`). */
+  /**
+   * Extra `uvx --with` requirements for the mcpo adapter. An entry naming
+   * `mcp` or `fastapi` replaces that package's default constraint (`mcp<2`,
+   * `fastapi<0.145`); any other entry is added alongside them.
+   */
   mcpoWith: string[];
   /** Adapter name → exact version, overriding the latest-floats default. */
   pins: Partial<Record<AdapterName, string>>;
   /** Remove configured header values from crosscheck-owned diagnostics. */
   redact: (text: string) => string;
-  target: TargetSpec;
+  target: AdapterTarget;
   timeoutMs: number;
-  /** Empty scratch directory used as a neutral cwd so package managers resolve no manifest. */
+  /**
+   * The run's scratch directory, used as a neutral cwd so package managers
+   * resolve no manifest. It also holds the stdio target's launch spec.
+   */
   workDir: string;
 }
 
@@ -248,16 +285,45 @@ export interface AdapterRunResult {
   adapter: AdapterName;
   canary: CanaryOutcome | null;
   durationMs: number;
+  /**
+   * Set only on an `ok` result whose surface is empty because the capture
+   * carried no MCP tools at all, with the adapter's own wording for that
+   * case. A client that never registered the server and a server that
+   * advertises no tools leave the same capture, and adapters never see ground
+   * truth, so `pairEmptyCapture` decides: a `handshake-failure` when ground
+   * truth lists a tool, a clean empty surface when it lists none.
+   */
+  emptyCapture?: { detail: string };
   /** Resolved version of the client actually exercised — latest floats, so every run records it. */
   resolvedVersion: string | null;
   /**
    * `ok`: surface captured. `handshake-failure`: client ran but could not speak to the server.
+   * `capture-failure`: the client finished, but crosscheck could not read what it captured —
+   * output that did not parse, or that crosscheck's own capture limit cut; no surface.
    * `adapter-broken`: the client itself failed to launch (install/import failure).
    */
-  status: 'adapter-broken' | 'handshake-failure' | 'ok';
+  status: 'adapter-broken' | 'capture-failure' | 'handshake-failure' | 'ok';
   statusDetail: string | null;
   surface: RenderedSurface | null;
 }
+
+/**
+ * What a client does with one advertised tool name it does not render
+ * verbatim. `renamed`: the rendered surface carries the tool as `rendered`,
+ * the name exactly as the adapter's parsed surface holds it. `dropped`: the
+ * client never sends the tool; `reason` is prose for the `tool-missing`
+ * detail, never identity.
+ */
+export type ToolRename =
+  | { change: ToolRenameChange; kind: 'renamed'; rendered: string }
+  | { kind: 'dropped'; reason: string };
+
+/**
+ * A client's rename model applied to one ground truth: advertised tool name →
+ * its fate. A name absent from the map renders unchanged. A `Map`, because
+ * the keys are server-authored names (`__proto__` included).
+ */
+export type ToolRenameMap = ReadonlyMap<string, ToolRename>;
 
 /** A runnable client adapter. */
 export interface Adapter {
@@ -267,6 +333,19 @@ export interface Adapter {
   run(ctx: AdapterContext): Promise<AdapterRunResult>;
   /** Returns true when the adapter can exercise this target, or a reason string when it cannot. */
   supports(target: TargetSpec): string | true;
+  /**
+   * The client's exact rename rule, for a client whose rendered tool names
+   * differ from the advertised ones; omitted when every name renders
+   * verbatim. Called with the ground-truth names exactly as `tools/list`
+   * listed them — that order, duplicates kept — and must be a pure function
+   * of that list, because a client's rule can depend on it: Claude Code keeps
+   * the first of the names that collide once sanitized, and Codex sorts by
+   * raw name before it hashes a collision group. Returns an entry for each
+   * distinct name the client renames or drops, and none for a name it
+   * renders verbatim. The engine matches each tool by the returned name and
+   * compares it under its ground-truth name.
+   */
+  toolRenames?(groundTruthNames: readonly string[]): ToolRenameMap;
 }
 
 /** Per-adapter slice of the final report. */

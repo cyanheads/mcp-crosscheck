@@ -1,35 +1,41 @@
 /**
  * @file src/target.ts
- * Pure lexical normalization for target tokens whose relative-path intent is explicit.
+ * The one definition of how a stdio target is started. Ground truth, its canary,
+ * and the launcher every client runs (`src/launch-target.ts`) all start the
+ * target from a `TargetLaunch`: the command and arguments as given, the SDK's
+ * default environment plus `--env` and nothing else, and the caller's working
+ * directory. A diff then measures the client, not how it launched the target.
  */
-import { posix, win32 } from 'node:path';
+import { getDefaultEnvironment } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { z } from 'zod';
 
 import type { TargetSpec } from './types.js';
 
-/** On Windows both separators mark an explicit-relative token: `./`, `../`, `.\`, `..\`. */
-const WIN32_EXPLICIT_RELATIVE = /^\.\.?[\\/]/u;
+/** Exactly what the target is started with, on every path. Also the launcher's spec file format. */
+export const TargetLaunchSchema = z.strictObject({
+  args: z.array(z.string()),
+  command: z.string(),
+  cwd: z.string(),
+  env: z.record(z.string(), z.string()),
+});
 
-function canonicalizeToken(token: string, cwd: string, platform: NodeJS.Platform): string {
-  if (platform === 'win32') {
-    return WIN32_EXPLICIT_RELATIVE.test(token) ? win32.resolve(cwd, token) : token;
-  }
-  return token.startsWith('./') || token.startsWith('../') ? posix.resolve(cwd, token) : token;
-}
+export type TargetLaunch = z.infer<typeof TargetLaunchSchema>;
 
 /**
- * Resolve explicit-relative stdio tokens once, without inspecting the filesystem.
- * `platform` selects the path semantics, so both spellings are testable on any host.
+ * The target's canonical environment: the variables the SDK's stdio transport
+ * inherits by default (`HOME`, `PATH`, and the like on POSIX), read from this
+ * process, plus the caller's `--env` values, which win.
  */
-export function canonicalizeTarget(
-  target: TargetSpec,
-  cwd: string,
-  platform: NodeJS.Platform,
-): TargetSpec {
-  if (target.kind === 'http') return target;
+export function targetEnvironment(env: Readonly<Record<string, string>>): Record<string, string> {
+  return { ...getDefaultEnvironment(), ...env };
+}
+
+/** How `target` is started: as given, with the canonical environment, in this process's working directory. */
+export function targetLaunch(target: Extract<TargetSpec, { kind: 'stdio' }>): TargetLaunch {
   return {
-    args: target.args.map((arg) => canonicalizeToken(arg, cwd, platform)),
-    command: canonicalizeToken(target.command, cwd, platform),
-    env: target.env,
-    kind: 'stdio',
+    args: target.args,
+    command: target.command,
+    cwd: process.cwd(),
+    env: targetEnvironment(target.env),
   };
 }

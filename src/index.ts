@@ -4,8 +4,12 @@
  * capture, invariant engine, adapters, report rendering) individually.
  */
 
-export { claudeCodeAdapter, surfaceFromClaudeCodeBody } from './adapters/claude-code.js';
-export { surfaceFromCodexBody } from './adapters/codex.js';
+export {
+  claudeCodeAdapter,
+  claudeCodeToolRenames,
+  surfaceFromClaudeCodeBody,
+} from './adapters/claude-code.js';
+export { codexToolRenames, surfaceFromCodexBody } from './adapters/codex.js';
 export { ADAPTERS, DEFAULT_ADAPTERS, isAdapterName } from './adapters/index.js';
 export { surfaceFromOpenApiDoc } from './adapters/mcpo.js';
 export {
@@ -27,6 +31,7 @@ export {
   compareSurface,
   depthLimitedPaths,
   groundTruthFindings,
+  pairEmptyCapture,
 } from './invariants.js';
 export { renderHumanReport, toJsonReport } from './report.js';
 export type { CrosscheckOptions } from './run.js';

@@ -1,11 +1,14 @@
 /**
  * @file src/run.ts
  * Orchestration: capture ground truth, preflight the canary against it, run
- * each selected adapter hermetically, and assemble the final report.
+ * each selected adapter hermetically, and assemble the final report. Every
+ * client starts a stdio target through the launcher (src/launch-target.ts),
+ * which starts it exactly as ground truth does.
  */
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, extname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { ADAPTERS, isAdapterName } from './adapters/index.js';
 import {
@@ -18,13 +21,24 @@ import {
 } from './baseline.js';
 import { validateHttpHeaders } from './cli-args.js';
 import { captureGroundTruth, runGroundTruthCanary } from './ground-truth.js';
-import { buildFindings, depthLimitedPaths, groundTruthFindings } from './invariants.js';
-import { createRedactor, redactRunReport, registerReportRedactor } from './redact.js';
+import {
+  buildFindings,
+  depthLimitedPaths,
+  groundTruthFindings,
+  pairEmptyCapture,
+} from './invariants.js';
+import {
+  createRedactor,
+  redactRunReport,
+  registerReportRedactor,
+  targetRedactor,
+} from './redact.js';
 import { truncationNote } from './report.js';
-import { canonicalizeTarget } from './target.js';
+import { targetLaunch } from './target.js';
 import type {
   AdapterName,
   AdapterReport,
+  AdapterTarget,
   BaselineDocument,
   CanarySpec,
   RunReport,
@@ -56,7 +70,11 @@ export interface CrosscheckOptions {
   /** Process seam passed to selected adapters; omitted runs real child processes. */
   exec?: Exec;
   log?: (line: string) => void;
-  /** Extra `uvx --with` dependency constraints for mcpo (e.g. `mcp<2`). */
+  /**
+   * Extra `uvx --with` requirements for mcpo. An entry naming `mcp` or
+   * `fastapi` replaces that package's default constraint (`mcp<2`,
+   * `fastapi<0.145`); any other entry is added alongside them.
+   */
   mcpoWith?: string[];
   /** Adapter name → exact version, overriding the latest-floats default. */
   pins?: Partial<Record<AdapterName, string>>;
@@ -74,8 +92,24 @@ const GENERATED_ARTIFACT_NAMES = [
   'report.json',
 ] as const;
 
-/** Reject an unknown, inherited, or repeated adapter name, and a pin naming no adapter. */
-function assertAdapterSelection(adapters: readonly string[], pins: object): void {
+const MODULE_PATH = fileURLToPath(import.meta.url);
+/**
+ * The launcher, beside this module with its extension: `launch-target.js` when
+ * built, `launch-target.ts` when Bun runs the sources and is `process.execPath`.
+ */
+const LAUNCHER = join(dirname(MODULE_PATH), `launch-target${extname(MODULE_PATH)}`);
+/** The stdio target's launch spec, inside the run's scratch directory. */
+const LAUNCH_SPEC_NAME = 'target-launch.json';
+
+/**
+ * Reject an unknown, inherited, or repeated adapter name, a pin naming no
+ * adapter, and a blank pin, whose `<package>@` npm would quietly resolve to
+ * latest. Each pin is checked whether or not its adapter is selected.
+ */
+function assertAdapterSelection(
+  adapters: readonly string[],
+  pins: Readonly<Record<string, unknown>>,
+): void {
   const selected = new Set<string>();
   for (const name of adapters) {
     if (!isAdapterName(name)) {
@@ -88,16 +122,54 @@ function assertAdapterSelection(adapters: readonly string[], pins: object): void
     }
     selected.add(name);
   }
-  for (const name of Object.keys(pins)) {
+  for (const [name, version] of Object.entries(pins)) {
     if (!isAdapterName(name)) {
       throw new CrosscheckUsageError(`pins names unknown adapter "${name}"`);
+    }
+    if (typeof version !== 'string' || version.trim() === '') {
+      throw new CrosscheckUsageError(
+        `pin for adapter "${name}" must be a non-blank version string`,
+      );
     }
   }
 }
 
-/** Canonicalize the target, then check an HTTP target's header map and URL scheme. */
-function validatedTarget(spec: TargetSpec): TargetSpec {
-  const target = canonicalizeTarget(spec, process.cwd(), process.platform);
+/**
+ * Write a stdio target's launch spec into the run's scratch directory, which is
+ * removed with the run, readable by this user only, and return the command line
+ * every client starts in the target's place. The spec carries the environment,
+ * so no `--env` value reaches a client's command line or configuration.
+ */
+async function launcherTarget(
+  target: Extract<TargetSpec, { kind: 'stdio' }>,
+  workDir: string,
+): Promise<AdapterTarget> {
+  const specPath = join(workDir, LAUNCH_SPEC_NAME);
+  await writeFile(specPath, JSON.stringify(targetLaunch(target)), { flag: 'wx', mode: 0o600 });
+  return { args: [LAUNCHER, specPath], command: process.execPath, kind: 'stdio' };
+}
+
+/**
+ * Remove the run's scratch directory, the launch spec first: it holds `--env`
+ * values, and unlinking it succeeds even while a client tree killed a moment
+ * ago still has the directory as its cwd, which on Windows refuses the
+ * directory's own removal (EBUSY) until that tree has exited. The retries
+ * cover that window. Cleanup never fails the run; a directory it could not
+ * remove is named in the log.
+ */
+async function removeWorkDir(workDir: string, log: (line: string) => void): Promise<void> {
+  try {
+    await rm(join(workDir, LAUNCH_SPEC_NAME), { force: true });
+    await rm(workDir, { force: true, maxRetries: 10, recursive: true, retryDelay: 100 });
+  } catch (error) {
+    log(
+      `could not remove the scratch directory ${workDir}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+/** Check an HTTP target's header map and URL scheme; a stdio target runs as given. */
+function validatedTarget(target: TargetSpec): TargetSpec {
   if (target.kind === 'stdio') return target;
   let headers: Record<string, string>;
   try {
@@ -155,7 +227,7 @@ export async function runCrosscheck(options: CrosscheckOptions): Promise<RunRepo
       throw new CrosscheckUsageError(`adapter "${name}": ${verdict}`);
     }
   }
-  const redact = createRedactor(target.kind === 'http' ? Object.values(target.headers ?? {}) : []);
+  const redact = targetRedactor(target);
   const writeLog = options.log ?? (() => {});
   const log = (line: string) => writeLog(redact(line));
 
@@ -217,22 +289,31 @@ export async function runCrosscheck(options: CrosscheckOptions): Promise<RunRepo
       log(`canary ${canary.tool} verified against ground truth`);
     }
 
+    const adapterTarget = target.kind === 'http' ? target : await launcherTarget(target, workDir);
+    const groundTruthNames = groundTruth.tools.map((tool) => tool.name);
     const adapterReports: AdapterReport[] = [];
     for (const name of options.adapters) {
       log(`running adapter: ${name}`);
-      const result = await ADAPTERS[name].run({
-        artifactsDir,
-        canary,
-        ...(options.exec === undefined ? {} : { exec: options.exec }),
-        log,
-        mcpoWith: options.mcpoWith ?? [],
-        pins: options.pins ?? {},
-        redact,
-        target,
-        timeoutMs,
-        workDir,
-      });
-      const findings = buildFindings(groundTruth.tools, result);
+      const adapter = ADAPTERS[name];
+      const renames = adapter.toolRenames?.(groundTruthNames);
+      // Paired here, not only inside buildFindings, so the status, detail, and tool count agree with the findings.
+      const result = pairEmptyCapture(
+        groundTruth.tools,
+        await adapter.run({
+          artifactsDir,
+          canary,
+          ...(options.exec === undefined ? {} : { exec: options.exec }),
+          log,
+          mcpoWith: options.mcpoWith ?? [],
+          pins: options.pins ?? {},
+          redact,
+          target: adapterTarget,
+          timeoutMs,
+          workDir,
+        }),
+        renames,
+      );
+      const findings = buildFindings(groundTruth.tools, result, renames);
       adapterReports.push({
         acknowledgedFindings: [],
         adapter: result.adapter,
@@ -320,8 +401,6 @@ export async function runCrosscheck(options: CrosscheckOptions): Promise<RunRepo
     if (error instanceof CrosscheckUsageError) throw new CrosscheckUsageError(message);
     throw new Error(message);
   } finally {
-    await rm(workDir, { force: true, recursive: true }).catch(() => {
-      /* scratch dir cleanup is best-effort */
-    });
+    await removeWorkDir(workDir, log);
   }
 }

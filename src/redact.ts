@@ -5,7 +5,7 @@
  * occurs inside rule ids, paths, and versions, and rewriting those would break
  * the machine contract and every baseline written from it.
  */
-import type { CanaryOutcome, Finding, RunReport } from './types.js';
+import type { CanaryOutcome, Finding, RunReport, TargetSpec } from './types.js';
 
 type Redact = (text: string) => string;
 
@@ -33,6 +33,11 @@ export function createRedactor(values: string[]): Redact {
       .split(REDACTED)
       .map((segment) => segment.replace(pattern, REDACTED))
       .join(REDACTED);
+}
+
+/** The redactor for a target's header values; a stdio target carries none. */
+export function targetRedactor(target: TargetSpec): Redact {
+  return createRedactor(target.kind === 'http' ? Object.values(target.headers ?? {}) : []);
 }
 
 function redactCanary(canary: CanaryOutcome | null, redact: Redact): CanaryOutcome | null {

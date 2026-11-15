@@ -1,119 +1,67 @@
 /**
  * @file src/target.test.ts
- * Lexical target canonicalization at the orchestration boundary.
+ * The canonical target launch: the environment, working directory, and command
+ * line ground truth and the client launcher share.
  */
 import { describe, expect, test } from 'bun:test';
-import { posix, resolve, win32 } from 'node:path';
 
-import { canonicalizeTarget } from './target.js';
+import { getDefaultEnvironment } from '@modelcontextprotocol/sdk/client/stdio.js';
+
+import { TargetLaunchSchema, targetEnvironment, targetLaunch } from './target.js';
 import type { TargetSpec } from './types.js';
 
-const CWD = resolve('workspace', 'project');
-
-function stdioTarget(token: string): TargetSpec {
-  return { args: [token], command: token, env: {}, kind: 'stdio' };
-}
-
-describe('canonicalizeTarget', () => {
-  test('resolves explicit-relative command and argument tokens against the injected cwd', () => {
-    const env = { FIXTURE_MODE: 'stdio' };
-    const target: TargetSpec = {
-      args: ['./server.js', '../shared/config.json'],
-      command: './bin/runner',
-      env,
-      kind: 'stdio',
-    };
-
-    const canonical = canonicalizeTarget(target, CWD, process.platform);
-
-    expect(canonical).toEqual({
-      args: [resolve(CWD, './server.js'), resolve(CWD, '../shared/config.json')],
-      command: resolve(CWD, './bin/runner'),
-      env,
-      kind: 'stdio',
-    });
-    expect(canonical.kind === 'stdio' && canonical.env).toBe(env);
-  });
-
-  test('leaves absolute, bare, URL, option, and non-prefix relative tokens unchanged', () => {
-    const absolute = resolve(CWD, 'server.js');
-    const args = [
-      absolute,
-      'server.js',
-      'https://example.com/relative.js',
-      'file:///tmp/server.js',
-      '--config',
-      '--config=./server.json',
-      '.',
-      '..',
-    ];
-    const target: TargetSpec = { args, command: 'node', env: {}, kind: 'stdio' };
-
-    expect(canonicalizeTarget(target, CWD, process.platform)).toEqual(target);
-  });
-
-  test('canonicalizes a missing explicit-relative path without preflighting it', () => {
-    const target: TargetSpec = {
-      args: ['./missing-server.js'],
-      command: 'node',
-      env: {},
-      kind: 'stdio',
-    };
-
-    expect(canonicalizeTarget(target, CWD, process.platform)).toEqual({
-      args: [resolve(CWD, './missing-server.js')],
-      command: 'node',
-      env: {},
-      kind: 'stdio',
+describe('targetEnvironment', () => {
+  test('is the SDK default environment plus the given values, which win', () => {
+    const defaults = getDefaultEnvironment();
+    expect(Object.keys(defaults)).toContain('PATH');
+    expect(targetEnvironment({})).toEqual(defaults);
+    expect(targetEnvironment({ HOME: '/elsewhere', MY_FLAG: '' })).toEqual({
+      ...defaults,
+      HOME: '/elsewhere',
+      MY_FLAG: '',
     });
   });
 
-  test('leaves HTTP targets unchanged', () => {
-    const target: TargetSpec = { kind: 'http', url: 'https://example.com/mcp' };
-
-    expect(canonicalizeTarget(target, CWD, process.platform)).toBe(target);
+  test('leaves out a variable this process has that is neither a default nor given', () => {
+    process.env.CROSSCHECK_TARGET_TEST_ONLY = 'exported';
+    try {
+      expect(Object.keys(targetEnvironment({}))).not.toContain('CROSSCHECK_TARGET_TEST_ONLY');
+    } finally {
+      delete process.env.CROSSCHECK_TARGET_TEST_ONLY;
+    }
   });
 });
 
-describe('canonicalizeTarget platform spellings', () => {
-  test('win32 resolves backslash and slash explicit-relative tokens with win32 semantics', () => {
-    const cwd = 'C:\\proj';
-    for (const token of ['.\\x', '..\\x', './x', '../x']) {
-      const expected = win32.resolve(cwd, token);
-      expect(canonicalizeTarget(stdioTarget(token), cwd, 'win32')).toEqual({
-        args: [expected],
-        command: expected,
-        env: {},
-        kind: 'stdio',
-      });
-    }
-    expect(canonicalizeTarget(stdioTarget('.\\dist\\index.js'), cwd, 'win32')).toMatchObject({
-      args: ['C:\\proj\\dist\\index.js'],
-    });
-    expect(canonicalizeTarget(stdioTarget('..\\shared\\server.js'), cwd, 'win32')).toMatchObject({
-      args: ['C:\\shared\\server.js'],
+describe('targetLaunch', () => {
+  test('keeps the command line as given and runs it in this process directory', () => {
+    const target: TargetSpec = {
+      args: ['./server.js', '../shared/config.json', 'bare/relative.js', '--flag', 'x', '-e', 'y'],
+      command: './bin/runner',
+      env: { MCP_MODE: 'probe' },
+      kind: 'stdio',
+    };
+    expect(targetLaunch(target)).toEqual({
+      args: ['./server.js', '../shared/config.json', 'bare/relative.js', '--flag', 'x', '-e', 'y'],
+      command: './bin/runner',
+      cwd: process.cwd(),
+      env: { ...getDefaultEnvironment(), MCP_MODE: 'probe' },
     });
   });
 
-  test('win32 leaves bare, absolute, dot-only, and non-prefix tokens unchanged', () => {
-    for (const token of ['server.js', 'C:\\abs\\server.js', '.', '..', '...\\x', '.hidden\\x']) {
-      expect(canonicalizeTarget(stdioTarget(token), 'C:\\proj', 'win32')).toEqual(
-        stdioTarget(token),
-      );
-    }
+  test('round-trips through its spec file format', () => {
+    const launch = targetLaunch({ args: ['a b', ''], command: 'node', env: {}, kind: 'stdio' });
+    expect(TargetLaunchSchema.parse(JSON.parse(JSON.stringify(launch)))).toEqual(launch);
   });
 
-  test('POSIX resolves slash spellings only; a backslash prefix is a legal filename', () => {
-    const cwd = '/proj';
-    for (const platform of ['linux', 'darwin'] as const) {
-      expect(canonicalizeTarget(stdioTarget('./x'), cwd, platform)).toMatchObject({
-        args: [posix.resolve(cwd, './x')],
-      });
-      expect(canonicalizeTarget(stdioTarget('../x'), cwd, platform)).toMatchObject({
-        args: [posix.resolve(cwd, '../x')],
-      });
-      expect(canonicalizeTarget(stdioTarget('.\\x'), cwd, platform)).toEqual(stdioTarget('.\\x'));
-      expect(canonicalizeTarget(stdioTarget('..\\x'), cwd, platform)).toEqual(stdioTarget('..\\x'));
+  test('the spec file format rejects a missing field, a wrong type, and an unknown key', () => {
+    const launch = { args: [], command: 'node', cwd: '/', env: {} };
+    for (const spec of [
+      { args: [], command: 'node', env: {} },
+      { ...launch, args: 'server.js' },
+      { ...launch, env: { PORT: 8080 } },
+      { ...launch, shell: true },
+    ]) {
+      expect(TargetLaunchSchema.safeParse(spec).success).toBe(false);
     }
   });
 });

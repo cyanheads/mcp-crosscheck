@@ -38,8 +38,9 @@ Flags:
                        HTTP request header for the target (repeatable; HTTP only).
   --pin <name=version> Pin an adapter version (repeatable), e.g. --pin mcpo=0.0.20.
                        claude-code requires the installed version to match its pin.
-  --mcpo-with <spec>   Extra uvx --with dependency constraint for mcpo (repeatable),
-                       e.g. --mcpo-with 'mcp<2'.
+  --mcpo-with <spec>   Extra uvx --with dependency constraint for mcpo (repeatable).
+                       mcpo runs with mcp<2 and fastapi<0.145 by default; an entry
+                       naming either package replaces that default.
   --artifacts <dir>    Save the report and raw captures: report.json, ground-truth.json,
                        mcpo.openapi.json, codex.request.json, claude-code.request.json.
   --timeout <seconds>  Per-stage timeout, 0.001 to ${MAX_TIMEOUT_MS / 1000}. Default: 120.
@@ -209,11 +210,15 @@ async function main(args: string[]): Promise<number> {
       target = { args: commandArgs, command, env, kind: 'stdio' };
     }
 
+    // A blank version is rejected by runCrosscheck, which serves the library too.
     const pins: Partial<Record<AdapterName, string>> = {};
     for (const entry of values.pin ?? []) {
       const [name, version] = parseKeyValue(entry, '--pin');
       if (!isAdapterName(name)) {
         throw new CrosscheckUsageError(`--pin names unknown adapter "${name}"`);
+      }
+      if (Object.hasOwn(pins, name)) {
+        throw new CrosscheckUsageError(`--pin names adapter "${name}" more than once`);
       }
       pins[name] = version;
     }

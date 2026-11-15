@@ -7,10 +7,11 @@
  * Comparison follows the normalized model all the way down: nested object
  * fields and array elements are checked by the same rules as root properties,
  * each finding scoped by a dotted path (`tool.config.transport.timeoutMs`,
- * `tool.tags[].name`). Termination is guaranteed by the normalizer, which
- * bounds the depth it walks; `depthLimitedPaths` names where that bound cut off
- * advertised fields. An advertised `outputSchema` is walked the same way under
- * an `output:` path prefix, at info tier throughout.
+ * `tool.tags[].name`) that starts at the advertised tool name, also for a tool
+ * a client renders under another name. Termination is guaranteed by the
+ * normalizer, which bounds the depth it walks; `depthLimitedPaths` names where
+ * that bound cut off advertised fields. An advertised `outputSchema` is walked
+ * the same way under an `output:` path prefix, at info tier throughout.
  *
  * `groundTruthFindings` checks the advertised surface on its own, with no
  * client involved; its notes are reported once per run, never per adapter.
@@ -29,6 +30,7 @@ import type {
   RenderedProperty,
   RenderedSurface,
   RenderedTool,
+  ToolRenameMap,
 } from './types.js';
 import { canonicalJson } from './util/canonical-json.js';
 
@@ -489,25 +491,69 @@ function compareOutput(gt: GroundTruthTool, rendered: RenderedTool): Finding[] {
   return compareOutputProperties(gtProperties, rendered.outputProperties, path);
 }
 
-/** Diff ground truth against one rendered surface. Pure; no I/O. */
+/** A `tool-missing` finding at the tool's advertised path. */
+function toolMissing(path: string, detail: string): Finding {
+  return {
+    detail,
+    evidence: { kind: 'tool-missing' },
+    path,
+    rule: 'tool-missing',
+    severity: 'fail',
+  };
+}
+
+/**
+ * Diff ground truth against one rendered surface. Pure; no I/O.
+ *
+ * Each tool is looked up under the name its client renders: the name itself,
+ * or its `renamed` entry in `renames`. A renamed tool adds one info
+ * `tool-renamed` finding, then compares like any other, every finding under
+ * its ground-truth path. A tool absent from the surface, and one the map
+ * marks `dropped`, is `tool-missing`; its detail names the expected rendered
+ * name or the client's reason. A `dropped` tool is never looked up, because
+ * the name it advertises can belong to another tool's rendering. With no map,
+ * every tool is looked up under its own name.
+ */
 export function compareSurface(
   groundTruthTools: GroundTruthTool[],
   rendered: RenderedSurface,
+  renames?: ToolRenameMap,
 ): Finding[] {
   const findings: Finding[] = [];
   for (const tool of groundTruthTools) {
-    const gtNormalized = renderedToolFromJsonSchema(tool.name, tool.description, tool.inputSchema);
-    const renderedTool = rendered.tools.find((candidate) => candidate.name === tool.name);
-    if (renderedTool === undefined) {
-      findings.push({
-        detail: 'tool is missing from the rendered surface',
-        evidence: { kind: 'tool-missing' },
-        path: tool.name,
-        rule: 'tool-missing',
-        severity: 'fail',
-      });
+    const rename = renames?.get(tool.name);
+    if (rename?.kind === 'dropped') {
+      findings.push(
+        toolMissing(
+          tool.name,
+          `tool is missing from the rendered surface — the client drops it: ${rename.reason}`,
+        ),
+      );
       continue;
     }
+    const renderedName = rename === undefined ? tool.name : rename.rendered;
+    const renderedTool = rendered.tools.find((candidate) => candidate.name === renderedName);
+    if (renderedTool === undefined) {
+      findings.push(
+        toolMissing(
+          tool.name,
+          rename === undefined
+            ? 'tool is missing from the rendered surface'
+            : `tool is missing from the rendered surface under its expected ${rename.change} name ${JSON.stringify(rename.rendered)}`,
+        ),
+      );
+      continue;
+    }
+    if (rename !== undefined) {
+      findings.push({
+        detail: `tool name was ${rename.change} in rendering — the client renders it as ${JSON.stringify(rename.rendered)}`,
+        evidence: { change: rename.change, kind: 'tool-renamed' },
+        path: tool.name,
+        rule: 'tool-renamed',
+        severity: 'info',
+      });
+    }
+    const gtNormalized = renderedToolFromJsonSchema(tool.name, tool.description, tool.inputSchema);
     findings.push(...compareTool(gtNormalized, renderedTool));
     findings.push(...compareOutput(tool, renderedTool));
   }
@@ -610,11 +656,46 @@ export function depthLimitedPaths(tools: GroundTruthTool[]): string[] {
   return [...paths].sort();
 }
 
-/** Assemble the full finding list for one adapter run, including run-level failures. */
-export function buildFindings(
+/**
+ * Settle an `emptyCapture` result against ground truth. When ground truth
+ * lists a tool the client would send, none of them reached the client, and the
+ * result becomes the `handshake-failure` capture-only adapters always reported
+ * for it: canary and surface null, the marker's detail as `statusDetail`, the
+ * marker removed. When ground truth lists no tools, or `renames` drops every
+ * one, an empty capture is what the client should send, and the result is
+ * returned as it is; so is every unmarked result. Idempotent and pure.
+ * `buildFindings` applies it first; a caller that also reports the result's
+ * `status` or tool count applies it itself, with the same `renames`, so the
+ * report and the findings agree.
+ */
+export function pairEmptyCapture(
   groundTruthTools: GroundTruthTool[],
   result: AdapterRunResult,
+  renames?: ToolRenameMap,
+): AdapterRunResult {
+  const sendsNone = groundTruthTools.every((tool) => renames?.get(tool.name)?.kind === 'dropped');
+  if (result.emptyCapture === undefined || sendsNone) return result;
+  const { emptyCapture, ...rest } = result;
+  return {
+    ...rest,
+    canary: null,
+    status: 'handshake-failure',
+    statusDetail: emptyCapture.detail,
+    surface: null,
+  };
+}
+
+/**
+ * Assemble the full finding list for one adapter run, including run-level
+ * failures, after `pairEmptyCapture`. `renames` is the adapter's rename map
+ * for this ground truth (see `compareSurface`).
+ */
+export function buildFindings(
+  groundTruthTools: GroundTruthTool[],
+  runResult: AdapterRunResult,
+  renames?: ToolRenameMap,
 ): Finding[] {
+  const result = pairEmptyCapture(groundTruthTools, runResult, renames);
   if (result.status === 'adapter-broken') {
     return [
       {
@@ -624,6 +705,19 @@ export function buildFindings(
         evidence: { kind: 'adapter-broken' },
         path: null,
         rule: 'adapter-broken',
+        severity: 'fail',
+      },
+    ];
+  }
+  if (result.status === 'capture-failure') {
+    return [
+      {
+        detail: `client output could not be captured${
+          result.statusDetail === null ? '' : ` — ${result.statusDetail}`
+        }`,
+        evidence: { kind: 'capture-failure' },
+        path: null,
+        rule: 'capture-failure',
         severity: 'fail',
       },
     ];
@@ -642,7 +736,7 @@ export function buildFindings(
     ];
   }
 
-  const findings = compareSurface(groundTruthTools, result.surface);
+  const findings = compareSurface(groundTruthTools, result.surface, renames);
   if (result.canary?.attempted === true && result.canary.ok === false) {
     findings.push({
       detail: `canary round-trip failed${result.canary.detail === null ? '' : ` — ${result.canary.detail}`}`,

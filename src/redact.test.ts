@@ -1,6 +1,6 @@
 /** @file src/redact.test.ts Exact header-value redaction through status and report outputs. */
 import { expect, test } from 'bun:test';
-import { createRedactor, registerReportRedactor } from './redact.js';
+import { createRedactor, registerReportRedactor, targetRedactor } from './redact.js';
 import { renderHumanReport, toJsonReport } from './report.js';
 import type { Finding, GroundTruthFinding, RunReport } from './types.js';
 
@@ -65,6 +65,18 @@ test('matches configured values literally, not as patterns', () => {
 test('ignores empty configured values instead of corrupting every string boundary', () => {
   expect(createRedactor([''])('unchanged')).toBe('unchanged');
   expect(createRedactor(['', 'secret'])('secret stays bounded')).toBe('[REDACTED] stays bounded');
+});
+
+test('a target redactor covers its header values, and a stdio target has none', () => {
+  const headers = { Authorization: 'Bearer\ttoken-1', 'X-Key': 'key-2' };
+  const text = 'sent Bearer\ttoken-1 and key-2 to the server';
+  expect(targetRedactor({ headers, kind: 'http', url: 'http://127.0.0.1/mcp' })(text)).toBe(
+    'sent [REDACTED] and [REDACTED] to the server',
+  );
+  expect(targetRedactor({ kind: 'http', url: 'http://127.0.0.1/mcp' })(text)).toBe(text);
+  expect(targetRedactor({ args: ['key-2'], command: 'node', env: {}, kind: 'stdio' })(text)).toBe(
+    text,
+  );
 });
 
 test('human and JSON report serialization apply the final redaction safeguard', () => {

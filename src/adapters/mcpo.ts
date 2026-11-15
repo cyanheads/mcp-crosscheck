@@ -3,7 +3,16 @@
  * mcpo adapter (open-webui's MCP → OpenAPI proxy). Boots `uvx mcpo` against
  * the target, reads the generated openapi.json as the rendered surface, and
  * optionally round-trips the canary as a live POST. Requires `uv` on PATH.
+ *
+ * An unpinned run resolves latest from PyPI once and spawns exactly that
+ * release, so a `uv tool install`-ed copy of another version never runs in its
+ * place. The proxy itself runs with the caller's environment; a stdio target
+ * arrives as the launcher command line (src/launch-target.ts), which applies
+ * the target's own environment.
  */
+import { writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+
 import {
   isRecord,
   renderedPropertiesFromJsonSchema,
@@ -19,18 +28,61 @@ import type {
   RenderedTool,
   TargetSpec,
 } from '../types.js';
-import { type Exec, excerpt, nodeExec } from '../util/exec.js';
-import { fetchJson, getFreePort, waitForReady } from '../util/net.js';
+import { type ChildExit, excerpt, nodeExec } from '../util/exec.js';
+import { type FetchJsonResult, fetchJson, getFreePort, waitForReady } from '../util/net.js';
 import { pypiLatestVersion } from '../util/versions.js';
 
-function packageSpec(ctx: AdapterContext): string {
-  const pin = ctx.pins.mcpo;
-  return pin === undefined ? 'mcpo' : `mcpo@${pin}`;
+/** A `uvx --with` requirement mcpo runs under unless a caller entry names the same package. */
+interface DefaultConstraint {
+  /** The package's PEP 503 normalized name. */
+  name: string;
+  requirement: string;
 }
 
-function uvxArgs(ctx: AdapterContext, port: number): string[] {
-  const withFlags = ctx.mcpoWith.flatMap((constraint) => ['--with', constraint]);
-  const base = [...withFlags, packageSpec(ctx), '--host', '127.0.0.1', '--port', String(port)];
+/**
+ * Python `mcp` 2.x removed `mcp.client.streamable_http.streamablehttp_client`,
+ * which mcpo 0.0.20 imports at startup (open-webui/mcpo#303).
+ */
+const MCP_BELOW_2: DefaultConstraint = { name: 'mcp', requirement: 'mcp<2' };
+
+/**
+ * FastAPI 0.145.0 removed `FastAPI(**extra)`, and mcpo 0.0.20 passes
+ * `ssl_certfile` to `FastAPI(...)`, so it exits with a TypeError; 0.144.0 runs.
+ */
+const FASTAPI_BELOW_0_145: DefaultConstraint = { name: 'fastapi', requirement: 'fastapi<0.145' };
+
+/**
+ * mcpo 0.0.20 declares `mcp` and `fastapi` with no upper bound, so an
+ * unconstrained resolve breaks every run. Each default goes once a mcpo
+ * release imports against current releases of its package.
+ */
+const DEFAULT_CONSTRAINTS = [MCP_BELOW_2, FASTAPI_BELOW_0_145];
+
+/**
+ * A PEP 508 requirement's project name, PEP 503 normalized (`MCP`, `mcp[cli]`
+ * → `mcp`), or null for an entry that opens with no name, such as a path.
+ */
+function requirementName(requirement: string): string | null {
+  const name = /^\s*([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)/.exec(requirement)?.[1];
+  return name === undefined ? null : name.replace(/[-_.]+/g, '-').toLowerCase();
+}
+
+/**
+ * The defaults no `--mcpo-with` entry replaces. An entry replaces the default
+ * for its own package only, since two constraints on one package would
+ * intersect.
+ */
+function defaultsInForce(mcpoWith: readonly string[]): string[] {
+  const named = new Set(mcpoWith.map(requirementName));
+  return DEFAULT_CONSTRAINTS.filter(({ name }) => !named.has(name)).map(
+    ({ requirement }) => requirement,
+  );
+}
+
+/** The `uvx` argv: the defaults in force, then the caller's `--with` entries in order. */
+function uvxArgs(ctx: AdapterContext, spec: string, defaults: string[], port: number): string[] {
+  const withFlags = [...defaults, ...ctx.mcpoWith].flatMap((entry) => ['--with', entry]);
+  const base = [...withFlags, spec, '--host', '127.0.0.1', '--port', String(port)];
   if (ctx.target.kind === 'http') {
     const headerEntries = Object.entries(ctx.target.headers ?? {});
     const headerFlags =
@@ -98,17 +150,23 @@ function toolFromPath(path: string, item: unknown, doc: unknown): RenderedTool |
   return tool;
 }
 
-async function resolveVersion(ctx: AdapterContext, exec: Exec): Promise<string | null> {
+/** The pin, or latest from PyPI; null when the lookup fails, and the run spawns `mcpo@latest`. */
+function resolveVersion(ctx: AdapterContext): Promise<string | null> {
   const pin = ctx.pins.mcpo;
-  if (pin !== undefined) return pin;
-  const withFlags = ctx.mcpoWith.flatMap((constraint) => ['--with', constraint]);
-  const result = await exec.capture('uvx', [...withFlags, packageSpec(ctx), '--version'], {
-    cwd: ctx.workDir,
-    timeoutMs: Math.min(ctx.timeoutMs, 120_000),
-  });
-  const match = `${result.stdout}\n${result.stderr}`.match(/\d+\.\d+\.\d+[^\s]*/);
-  if (match !== null) return match[0];
-  return pypiLatestVersion('mcpo');
+  return pin === undefined ? pypiLatestVersion('mcpo') : Promise.resolve(pin);
+}
+
+/** Why the proxy exited before serving, from how it ended and what it printed. */
+function exitedDetail(ctx: AdapterContext, exit: ChildExit, stderr: string): string {
+  if (exit.spawnErrorCode === 'ENOENT') {
+    return 'uvx is not on PATH — it ships with uv (https://docs.astral.sh/uv/)';
+  }
+  if (exit.spawnErrorCode !== undefined) {
+    return excerpt(ctx.redact(`uvx could not start — ${stderr}`));
+  }
+  return stderr.trim() === ''
+    ? `mcpo exited before becoming ready with exit code ${exit.code}`
+    : excerpt(ctx.redact(`mcpo exited before becoming ready — ${stderr}`));
 }
 
 async function runCanary(ctx: AdapterContext, port: number): Promise<CanaryOutcome | null> {
@@ -122,25 +180,37 @@ async function runCanary(ctx: AdapterContext, port: number): Promise<CanaryOutco
     if (!response.ok) {
       return {
         attempted: true,
-        detail: ctx.redact(excerpt(`HTTP ${response.status} — ${response.text}`)),
+        detail: excerpt(ctx.redact(`HTTP ${response.status} — ${response.text}`)),
         ok: false,
       };
     }
     return { attempted: true, detail: null, ok: true };
   } catch (error) {
-    return { attempted: true, detail: ctx.redact(excerpt(String(error))), ok: false };
+    return { attempted: true, detail: excerpt(ctx.redact(String(error))), ok: false };
   }
 }
 
+/**
+ * The first `openapi.json` response ends the wait for readiness and is the
+ * capture. mcpo registers every tool route during its startup, which uvicorn
+ * completes before it accepts a connection, so any HTTP answer comes from a
+ * proxy that is fully up: a refused connection is the only "not yet".
+ */
 async function run(ctx: AdapterContext): Promise<AdapterRunResult> {
   const startedAt = Date.now();
   const exec = ctx.exec ?? nodeExec;
-  const resolvedVersion = await resolveVersion(ctx, exec);
+  const resolvedVersion = await resolveVersion(ctx);
+  const spec = `mcpo@${resolvedVersion ?? 'latest'}`;
   const port = await getFreePort();
-  ctx.log(`mcpo: resolved ${resolvedVersion ?? 'unknown version'}, proxy on :${port}`);
+  const defaults = defaultsInForce(ctx.mcpoWith);
+  if (defaults.length > 0) {
+    ctx.log(
+      `mcpo: default constraints ${defaults.join(', ')} (a --mcpo-with entry for the same package replaces its default)`,
+    );
+  }
+  ctx.log(`mcpo: running ${spec}, proxy on :${port}`);
 
-  const env = ctx.target.kind === 'stdio' ? ctx.target.env : {};
-  const proc = exec.spawn('uvx', uvxArgs(ctx, port), { cwd: ctx.workDir, env });
+  const proc = exec.spawn('uvx', uvxArgs(ctx, spec, defaults, port), { cwd: ctx.workDir });
 
   const finish = (partial: Omit<AdapterRunResult, 'adapter' | 'durationMs' | 'resolvedVersion'>) =>
     ({
@@ -149,43 +219,46 @@ async function run(ctx: AdapterContext): Promise<AdapterRunResult> {
       resolvedVersion,
       ...partial,
     }) satisfies AdapterRunResult;
+  const failed = (status: AdapterRunResult['status'], statusDetail: string) =>
+    finish({ canary: null, status, statusDetail, surface: null });
 
   try {
     const openapiUrl = `http://127.0.0.1:${port}/openapi.json`;
+    const served = Promise.withResolvers<FetchJsonResult>();
     const failure = await waitForReady({
-      failFast: () =>
-        proc.hasExited()
-          ? `mcpo exited before becoming ready — ${ctx.redact(excerpt(proc.stderrTail()))}`
-          : null,
+      failFast: () => (proc.hasExited() ? 'mcpo exited before becoming ready' : null),
       intervalMs: 500,
-      probe: async () => (await fetchJson(openapiUrl, { timeoutMs: 5_000 })).ok,
+      // A refused connection throws, which keeps the wait going.
+      probe: async () => {
+        served.resolve(await fetchJson(openapiUrl, { timeoutMs: 5_000 }));
+        return true;
+      },
       timeoutMs: ctx.timeoutMs,
     });
     if (failure !== null) {
-      const broken = proc.hasExited();
-      return finish({
-        canary: null,
-        status: broken ? 'adapter-broken' : 'handshake-failure',
-        statusDetail: failure,
-        surface: null,
-      });
+      return proc.hasExited()
+        ? failed('adapter-broken', exitedDetail(ctx, await proc.exited, proc.stderrTail()))
+        : failed('handshake-failure', failure);
     }
-
-    const response = await fetchJson(openapiUrl, { timeoutMs: 30_000 });
+    // Ready means the probe resolved this.
+    const response = await served.promise;
+    if (!response.ok) {
+      return failed(
+        'handshake-failure',
+        excerpt(ctx.redact(`openapi.json returned HTTP ${response.status} — ${response.text}`)),
+      );
+    }
     const surface = surfaceFromOpenApiDoc(response.body);
     if (surface === null) {
-      return finish({
-        canary: null,
-        status: 'handshake-failure',
-        statusDetail: 'openapi.json was not parseable',
-        surface: null,
-      });
+      return failed(
+        'capture-failure',
+        `openapi.json was not an OpenAPI document (${Buffer.byteLength(response.text)} bytes)`,
+      );
     }
 
     if (ctx.artifactsDir !== null) {
-      const { writeFile } = await import('node:fs/promises');
       await writeFile(
-        `${ctx.artifactsDir}/mcpo.openapi.json`,
+        join(ctx.artifactsDir, 'mcpo.openapi.json'),
         JSON.stringify(response.body, null, 2),
       );
     }

@@ -9,17 +9,21 @@
  * a non-object `outputSchema` root — both valid JSON Schema, and typical of
  * the servers whose rendering differs most between clients. Each tool it
  * rejects is captured anyway, with the rejection recorded on the tool.
+ *
+ * A stdio target starts from its `TargetLaunch` (src/target.ts), the same one
+ * every client's launcher reads, and its stderr is read for as long as the
+ * session lasts: a session that fails after the target exited reports the end
+ * of what the target wrote there.
  */
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import {
-  getDefaultEnvironment,
-  StdioClientTransport,
-} from '@modelcontextprotocol/sdk/client/stdio.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { type Tool, ToolSchema } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 
+import { targetRedactor } from './redact.js';
+import { targetLaunch } from './target.js';
 import type {
   CanaryOutcome,
   CanarySpec,
@@ -32,6 +36,8 @@ import { excerpt } from './util/exec.js';
 import { VERSION } from './version.js';
 
 const MAX_TOOL_PAGES = 100;
+/** How much of a stdio target's most recent stderr is kept for a failure's message. */
+const STDERR_TAIL_BYTES = 64 * 1024;
 
 /**
  * One advertised tool, checked only for what ground truth needs: a string
@@ -57,19 +63,42 @@ function buildHttpTransport(target: Extract<TargetSpec, { kind: 'http' }>) {
   });
 }
 
-function buildTransport(target: TargetSpec): Transport {
+/** A session's transport, and the error a failure of that session surfaces. */
+interface SessionTransport {
+  sessionError(error: unknown): unknown;
+  transport: Transport;
+}
+
+/**
+ * Read a stdio target's stderr into a bounded tail from the start: a pipe
+ * nobody reads fills, and a server that writes it synchronously then stalls.
+ */
+function drainStderr(transport: StdioClientTransport): () => string {
+  let tail = Buffer.alloc(0);
+  transport.stderr?.on('data', (chunk: Buffer) => {
+    tail = Buffer.concat([tail, chunk]).subarray(-STDERR_TAIL_BYTES);
+  });
+  return () => tail.toString('utf8');
+}
+
+function buildTransport(target: TargetSpec): SessionTransport {
   if (target.kind === 'http') {
     // Widening cast: the SDK is not compiled with exactOptionalPropertyTypes,
     // so its concrete transport's `sessionId: string | undefined` does not
     // satisfy the Transport interface under this project's stricter settings.
-    return buildHttpTransport(target) as Transport;
+    return { sessionError: (error) => error, transport: buildHttpTransport(target) as Transport };
   }
-  return new StdioClientTransport({
-    args: target.args,
-    command: target.command,
-    env: { ...getDefaultEnvironment(), ...target.env },
-    stderr: 'ignore',
-  });
+  const transport = new StdioClientTransport({ ...targetLaunch(target), stderr: 'pipe' });
+  const stderrTail = drainStderr(transport);
+  return {
+    sessionError: (error) => {
+      const tail = stderrTail();
+      // A live target's stderr does not explain a failed request; an exited one's may say why it died.
+      if (transport.pid !== null || tail.trim() === '' || !(error instanceof Error)) return error;
+      return new Error(`${error.message} — server stderr: ${excerpt(tail)}`, { cause: error });
+    },
+    transport,
+  };
 }
 
 /** One rejecting deadline shared by every stage of a ground-truth session. */
@@ -107,11 +136,13 @@ async function withClient<T>(
   fn: (client: Client) => Promise<T>,
 ): Promise<T> {
   const client = new Client({ name: 'mcp-crosscheck', version: VERSION });
-  const transport = buildTransport(target);
+  const { sessionError, transport } = buildTransport(target);
   const deadline = sessionDeadline(timeoutMs);
   try {
     await Promise.race([client.connect(transport), deadline.expired]);
     return await Promise.race([fn(client), deadline.expired]);
+  } catch (error) {
+    throw sessionError(error);
   } finally {
     deadline.cancel();
     await client.close().catch(() => {
@@ -214,8 +245,9 @@ interface ToolMetadataCache {
   cacheToolMetadata(tools: Tool[]): void;
 }
 
-function canaryFailure(detail: string): CanaryOutcome {
-  return { attempted: true, detail: excerpt(detail), ok: false };
+/** Redacted whole before the excerpt cuts or whitespace-collapses a header value. */
+function canaryFailure(detail: string, redact: (text: string) => string): CanaryOutcome {
+  return { attempted: true, detail: excerpt(redact(detail)), ok: false };
 }
 
 /**
@@ -223,13 +255,15 @@ function canaryFailure(detail: string): CanaryOutcome {
  * page that advertises it, then call it before requesting another page, so the
  * SDK checks the result against the tool's `outputSchema`. This must succeed
  * before any adapter runs. A failure here comes from the canary spec or the
- * server itself, never from a client under test.
+ * server itself, never from a client under test. Its detail is free of the
+ * target's header values.
  */
 export async function runGroundTruthCanary(
   target: TargetSpec,
   canary: CanarySpec,
   timeoutMs: number,
 ): Promise<CanaryOutcome> {
+  const redact = targetRedactor(target);
   try {
     return await withClient(target, timeoutMs, async (client) => {
       const walk = await walkToolList(client, timeoutMs, (tools) =>
@@ -240,12 +274,14 @@ export async function runGroundTruthCanary(
           `canary tool "${canary.tool}" was not found in ${walk.pagesRead} page(s) of tools/list${
             walk.truncation === null ? '' : ` (the walk stopped early: ${walk.truncation.reason})`
           }`,
+          redact,
         );
       }
       const accepted = ToolSchema.safeParse(walk.found);
       if (!accepted.success) {
         return canaryFailure(
           `canary tool "${canary.tool}" is advertised with a definition clients on @modelcontextprotocol/sdk 1.x reject, so they can neither list nor call it — ${rejectionEntries(accepted.error.issues).join('; ')}`,
+          redact,
         );
       }
       // A private method across a caret range: name the incompatibility rather than blame the server.
@@ -253,6 +289,7 @@ export async function runGroundTruthCanary(
       if (typeof cache.cacheToolMetadata !== 'function') {
         return canaryFailure(
           'the installed @modelcontextprotocol/sdk client has no cacheToolMetadata, which the canary needs to apply the SDK output-schema checks; this SDK release is incompatible with this mcp-crosscheck version',
+          redact,
         );
       }
       cache.cacheToolMetadata([accepted.data]);
@@ -267,11 +304,11 @@ export async function runGroundTruthCanary(
           content !== undefined && typeof content === 'object' && 'text' in content
             ? String(content.text)
             : 'tool returned isError';
-        return canaryFailure(text);
+        return canaryFailure(text, redact);
       }
       return { attempted: true, detail: null, ok: true };
     });
   } catch (error) {
-    return canaryFailure(String(error));
+    return canaryFailure(String(error), redact);
   }
 }

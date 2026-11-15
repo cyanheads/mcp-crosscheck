@@ -5,7 +5,7 @@
  * with --error-on-warnings, so a green run means zero diagnostics.
  */
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 
 interface Step {
   name: string;
@@ -61,6 +61,14 @@ const steps: Step[] = [
         return { detail: 'dist/cli.js is missing — build failed?', ok: false };
       }
     },
+  },
+  {
+    // run.ts starts every client's stdio target through this file; the tests only reach src/.
+    name: 'Target launcher is built',
+    run: () =>
+      existsSync('dist/launch-target.js')
+        ? { ok: true }
+        : { detail: 'dist/launch-target.js is missing — build failed?', ok: false },
   },
 ];
 

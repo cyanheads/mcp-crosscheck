@@ -11,6 +11,7 @@ import {
   BaselineValidationError,
   baselineEntryFromFinding,
   parseBaseline,
+  RUNTIME_RULES,
   reconcileBaseline,
   serializeBaseline,
   updateBaseline,
@@ -23,7 +24,10 @@ import type {
   BaselineEntry,
   BaselineEvidence,
   Finding,
+  FindingEvidence,
   GroundTruthTool,
+  RuleId,
+  ToolRenameMap,
 } from './types.js';
 
 const constraintFinding: Finding = {
@@ -394,6 +398,89 @@ describe('baseline parser and serialization', () => {
       BaselineValidationError,
     );
   });
+
+  /**
+   * Every evidence kind a baseline never holds, with the evidence the engine
+   * emits for it; `satisfies` fails the typecheck when a kind is not listed.
+   */
+  const NEVER_BASELINED = {
+    'adapter-broken': { kind: 'adapter-broken' },
+    'canary-failed': { kind: 'canary-failed' },
+    'capture-failure': { kind: 'capture-failure' },
+    'handshake-failure': { kind: 'handshake-failure' },
+    'sdk-v1-rejected': { kind: 'sdk-v1-rejected' },
+    'unsupported-dialect': {
+      declared: 'http://json-schema.org/draft-04/schema#',
+      kind: 'unsupported-dialect',
+    },
+  } satisfies {
+    [Kind in Exclude<FindingEvidence['kind'], BaselineEvidence['kind']>]: Extract<
+      FindingEvidence,
+      { kind: Kind }
+    >;
+  };
+
+  test('runtime and ground-truth evidence never becomes an entry, even on a scoped finding, and an entry naming its rule fails strict parsing', () => {
+    for (const [kind, evidence] of Object.entries(NEVER_BASELINED)) {
+      // A path is set so the evidence decides, not the null-path shortcut runtime findings take.
+      const finding: Finding = {
+        detail: 'irrelevant',
+        evidence,
+        path: 'echo',
+        rule: kind as RuleId,
+        severity: 'fail',
+      };
+      expect(baselineEntryFromFinding('codex', finding)).toBeNull();
+      expect(
+        updateBaseline(EMPTY, [
+          { adapter: 'codex', comparisonSucceeded: true, findings: [finding] },
+        ]),
+      ).toEqual(EMPTY);
+      const text = JSON.stringify({
+        baselineVersion: 1,
+        entries: [{ adapter: 'codex', evidence, path: 'echo', rule: kind }],
+      });
+      expect(() => parseBaseline(text)).toThrow(`rule "${kind}" is not baselineable`);
+    }
+  });
+
+  test('the runtime rules a failed run reports are exactly the four non-rendering failures', () => {
+    expect([...RUNTIME_RULES].sort()).toEqual([
+      'adapter-broken',
+      'canary-failed',
+      'capture-failure',
+      'handshake-failure',
+    ]);
+  });
+
+  test('tool-renamed evidence parses for each change kind and rejects anything else', () => {
+    const entry = (rule: string, evidence: Record<string, unknown>) =>
+      JSON.stringify({
+        baselineVersion: 1,
+        entries: [{ adapter: 'claude-code', evidence, path: 'files.read', rule }],
+      });
+    for (const change of ['hashed', 'sanitized'] as const) {
+      expect(
+        parseBaseline(entry('tool-renamed', { change, kind: 'tool-renamed' })).entries,
+      ).toEqual([
+        {
+          adapter: 'claude-code',
+          evidence: { change, kind: 'tool-renamed' },
+          path: 'files.read',
+          rule: 'tool-renamed',
+        },
+      ]);
+    }
+    for (const text of [
+      entry('tool-renamed', { kind: 'tool-renamed' }),
+      entry('tool-renamed', { change: 'truncated', kind: 'tool-renamed' }),
+      entry('tool-renamed', { change: 'sanitized', kind: 'tool-renamed', rendered: 'files_read' }),
+      entry('tool-missing', { change: 'sanitized', kind: 'tool-renamed' }),
+      entry('tool-renamed', { kind: 'tool-missing' }),
+    ]) {
+      expect(() => parseBaseline(text)).toThrow(BaselineValidationError);
+    }
+  });
 });
 
 describe('baseline reconciliation and updates', () => {
@@ -501,6 +588,61 @@ describe('baseline reconciliation and updates', () => {
       ]),
     ).toEqual({ baselineVersion: 1, entries: [codexEntry] });
   });
+
+  test('a rename round-trips, and the tool-missing entry an unmapped run wrote for it goes stale', () => {
+    const inputSchema = { properties: { path: { type: 'string' } }, type: 'object' };
+    const groundTruth: GroundTruthTool[] = [
+      { description: 'Read files.', inputSchema, name: 'files.read' },
+    ];
+    const surface = {
+      tools: [renderedToolFromJsonSchema('files_read', 'Read files.', inputSchema)],
+    };
+    const renames: ToolRenameMap = new Map([
+      ['files.read', { change: 'sanitized', kind: 'renamed', rendered: 'files_read' }],
+    ]);
+    // What a run without the rename map wrote: the renamed tool reported as missing.
+    const unmapped = updateBaseline(EMPTY, [
+      {
+        adapter: 'codex',
+        comparisonSucceeded: true,
+        findings: compareSurface(groundTruth, surface),
+      },
+    ]);
+    expect(unmapped.entries).toEqual([
+      {
+        adapter: 'codex',
+        evidence: { kind: 'tool-missing' },
+        path: 'files.read',
+        rule: 'tool-missing',
+      },
+    ]);
+
+    const findings = compareSurface(groundTruth, surface, renames);
+    const states = [{ adapter: 'codex' as const, comparisonSucceeded: true, findings }];
+    const stale = reconcileBaseline(unmapped, states);
+    expect(stale.adapters[0]?.newFindings).toEqual(findings);
+    expect(findings.map((finding) => [finding.rule, finding.severity])).toEqual([
+      ['tool-renamed', 'info'],
+    ]);
+    expect(stale.baselineDiagnostics).toEqual([
+      { adapter: 'codex', entry: unmapped.entries[0]!, kind: 'stale' },
+    ]);
+
+    const updated = updateBaseline(unmapped, states);
+    expect(updated.entries).toEqual([
+      {
+        adapter: 'codex',
+        evidence: { change: 'sanitized', kind: 'tool-renamed' },
+        path: 'files.read',
+        rule: 'tool-renamed',
+      },
+    ]);
+    expect(parseBaseline(serializeBaseline(updated))).toEqual(updated);
+    const reread = reconcileBaseline(parseBaseline(serializeBaseline(updated)), states);
+    expect(reread.adapters[0]?.acknowledgedFindings).toEqual(findings);
+    expect(reread.adapters[0]?.newFindings).toEqual([]);
+    expect(reread.baselineDiagnostics).toEqual([]);
+  });
 });
 
 describe('canonical finding identity', () => {
@@ -523,6 +665,7 @@ describe('canonical finding identity', () => {
     'property-untyped': true,
     'required-dropped': true,
     'tool-missing': true,
+    'tool-renamed': true,
   } satisfies Record<BaselineEvidence['kind'], true>;
 
   /** Update an empty baseline from these findings, then reconcile the same findings against it. */
@@ -578,7 +721,11 @@ describe('canonical finding identity', () => {
         name: 'quiet',
         outputSchema: object({ z: { type: 'string' } }),
       },
+      { description: 'Renamed.', inputSchema: object({}), name: 'files.read' },
     ];
+    const renames: ToolRenameMap = new Map([
+      ['files.read', { change: 'sanitized', kind: 'renamed', rendered: 'files_read' }],
+    ]);
     const edge = renderedToolFromJsonSchema(
       'edge',
       'Edge cases.',
@@ -595,19 +742,24 @@ describe('canonical finding identity', () => {
     );
     const quiet = renderedToolFromJsonSchema('quiet', 'Quiet.', object({}));
     quiet.outputProperties = [];
-    const findings = compareSurface(groundTruth, {
-      tools: [
-        renderedToolFromJsonSchema('union', 'Union.', object({ a: { type: 'string' } })),
-        renderedToolFromJsonSchema('lookup', 'Look up.', {
-          ...groundTruth[2]!.inputSchema,
-          additionalProperties: false,
-          properties: {},
-        }),
-        renderedToolFromJsonSchema('empty', 'Empty.', object({})),
-        edge,
-        quiet,
-      ],
-    });
+    const findings = compareSurface(
+      groundTruth,
+      {
+        tools: [
+          renderedToolFromJsonSchema('union', 'Union.', object({ a: { type: 'string' } })),
+          renderedToolFromJsonSchema('lookup', 'Look up.', {
+            ...groundTruth[2]!.inputSchema,
+            additionalProperties: false,
+            properties: {},
+          }),
+          renderedToolFromJsonSchema('empty', 'Empty.', object({})),
+          edge,
+          quiet,
+          renderedToolFromJsonSchema('files_read', 'Renamed.', object({})),
+        ],
+      },
+      renames,
+    );
 
     expect(new Set<string>(findings.map((finding) => finding.evidence.kind))).toEqual(
       new Set(Object.keys(EVERY_KIND)),
@@ -615,6 +767,7 @@ describe('canonical finding identity', () => {
     expect(findings.map((finding) => [finding.path, finding.evidence])).toEqual(
       expect.arrayContaining([
         ['', { kind: 'tool-missing' }],
+        ['files.read', { change: 'sanitized', kind: 'tool-renamed' }],
         ['edge.bare', { groundTruthType: '', kind: 'property-untyped' }],
         ['edge.blank', { from: '', kind: 'property-retyped', to: 'string' }],
         ['edge', { kind: 'required-dropped', names: [''] }],

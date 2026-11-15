@@ -1,9 +1,14 @@
 /**
  * @file src/util/versions.ts
- * Resolved-version reporting. Latest floats by design, so every run records
- * what it actually exercised: pins short-circuit, registry lookups are
- * best-effort and bounded, and null degrades to "version unresolved".
+ * Registry lookups for an unpinned adapter's latest release. Latest floats by
+ * design, so an unpinned run asks the registry once, spawns exactly the
+ * release it names on every invocation, and reports it: a bare package name
+ * could run a locally installed copy of another version instead. Lookups are
+ * bounded and best-effort; null means unresolved, and the run spawns
+ * `@latest` and reports no version.
  */
+import { z } from 'zod';
+
 import type { Exec } from './exec.js';
 
 /** Latest published version of an npm package, via `npm view`. */
@@ -20,10 +25,13 @@ export async function npmLatestVersion(
   return match?.[0] ?? null;
 }
 
+/** The part of PyPI's project JSON this reads: `info.version` is the latest release. */
+const PypiProject = z.object({ info: z.object({ version: z.string().min(1) }) });
+
 /**
- * Latest published version of a PyPI package, via the JSON API. This is a live
- * `fetch` outside the Exec seam — tests that exercise unpinned mcpo paths must
- * pin the version so this fallback stays unreachable.
+ * Latest release of a PyPI package, from its JSON API, or null when the
+ * lookup fails or the body is not that shape. A live `fetch` outside the Exec
+ * seam: a test that runs an unpinned mcpo stubs `fetch`.
  */
 export async function pypiLatestVersion(pkg: string, timeoutMs = 10_000): Promise<string | null> {
   try {
@@ -31,12 +39,8 @@ export async function pypiLatestVersion(pkg: string, timeoutMs = 10_000): Promis
       signal: AbortSignal.timeout(timeoutMs),
     });
     if (!response.ok) return null;
-    const body: unknown = await response.json();
-    if (typeof body !== 'object' || body === null || !('info' in body)) return null;
-    const { info } = body as { info: unknown };
-    if (typeof info !== 'object' || info === null || !('version' in info)) return null;
-    const { version } = info as { version: unknown };
-    return typeof version === 'string' ? version : null;
+    const parsed = PypiProject.safeParse(await response.json());
+    return parsed.success ? parsed.data.info.version : null;
   } catch {
     return null;
   }

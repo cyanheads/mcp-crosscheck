@@ -4,6 +4,16 @@
  * headlessly for a verbatim `tools/list`, doubling as the protocol-handshake
  * baseline, plus an optional `tools/call` canary round-trip.
  *
+ * Every invocation in a run spawns one exact release: the pin, or latest as
+ * the registry reports it once at the start of the run. npx runs a globally
+ * installed copy for a bare package name whatever its version, but for a
+ * versioned spec only when it is that same release.
+ *
+ * A stdio target arrives as the launcher command line (src/launch-target.ts),
+ * which carries the target's own command, arguments, and environment in its
+ * spec file. Inspector sees none of them, so its own argument parsing, which
+ * varies by release, never touches them.
+ *
  * The canary goes out as a single `--tool-args-json` object, which the client
  * passes through untouched. Its `--tool-arg key=value` alternative runs every
  * value through `JSON.parse` and keeps the raw text only when that throws, so a
@@ -21,8 +31,10 @@ import type {
   RenderedSurface,
   TargetSpec,
 } from '../types.js';
-import { type Exec, excerpt, nodeExec } from '../util/exec.js';
+import { type Exec, type ExecResult, excerpt, nodeExec } from '../util/exec.js';
 import { npmLatestVersion } from '../util/versions.js';
+
+const PACKAGE = '@modelcontextprotocol/inspector';
 
 const ListToolsOutput = z.object({
   tools: z.array(
@@ -40,24 +52,17 @@ const CallToolOutput = z.object({
   isError: z.boolean().optional(),
 });
 
-function packageSpec(ctx: AdapterContext): string {
-  const pin = ctx.pins.inspector;
-  return pin === undefined
-    ? '@modelcontextprotocol/inspector'
-    : `@modelcontextprotocol/inspector@${pin}`;
-}
-
-function baseArgs(ctx: AdapterContext): string[] {
+/** The client's argv up to `--method`; `spec` is the one package spec the run spawns. */
+function baseArgs(ctx: AdapterContext, spec: string): string[] {
   const { target } = ctx;
   if (target.kind === 'http') {
     const headerFlags = Object.entries(target.headers ?? {}).flatMap(([name, value]) => [
       '--header',
       `${name}: ${value}`,
     ]);
-    return ['-y', packageSpec(ctx), '--cli', target.url, '--transport', 'http', ...headerFlags];
+    return ['-y', spec, '--cli', target.url, '--transport', 'http', ...headerFlags];
   }
-  const envFlags = Object.entries(target.env).flatMap(([key, value]) => ['-e', `${key}=${value}`]);
-  return ['-y', packageSpec(ctx), '--cli', ...envFlags, target.command, ...target.args];
+  return ['-y', spec, '--cli', target.command, ...target.args];
 }
 
 function parseJsonLoose(stdout: string): unknown {
@@ -81,7 +86,32 @@ function resolveVersion(ctx: AdapterContext, exec: Exec): Promise<string | null>
   if (pin !== undefined) return Promise.resolve(pin);
   // The inspector binary has no --version flag — a bare invocation launches
   // its UI server and never exits — so latest resolves via the registry.
-  return npmLatestVersion('@modelcontextprotocol/inspector', ctx.workDir, exec);
+  return npmLatestVersion(PACKAGE, ctx.workDir, exec);
+}
+
+/** Why npx never started, or null when it did. Only a missing npx gets its own wording. */
+function spawnFailureDetail(ctx: AdapterContext, result: ExecResult): string | null {
+  if (result.spawnErrorCode === undefined) return null;
+  return result.spawnErrorCode === 'ENOENT'
+    ? 'npx is not on PATH — it ships with npm, part of Node.js'
+    : excerpt(ctx.redact(`npx could not start — ${result.stderr}`));
+}
+
+/**
+ * The detail for an exit-0 output that did not parse: its size in bytes and
+ * whether crosscheck's capture limit cut it, never its text, which can hold
+ * schema prose that reads like an error.
+ */
+function unparsedDetail(method: 'tools/call' | 'tools/list', result: ExecResult): string {
+  const bytes = Buffer.byteLength(result.stdout);
+  return result.stdoutTruncated === true
+    ? `${method} output exceeded the capture limit (${bytes} bytes captured)`
+    : `${method} output did not parse (${bytes} bytes)`;
+}
+
+/** The detail for a non-zero exit: what the client printed, stderr first. */
+function exitDetail(ctx: AdapterContext, result: ExecResult): string {
+  return excerpt(ctx.redact(result.stderr === '' ? result.stdout : result.stderr));
 }
 
 /** First release carrying `--tool-args-json`, which passes argument values verbatim. */
@@ -113,6 +143,7 @@ function canaryArgFlags(
 async function runCanary(
   ctx: AdapterContext,
   exec: Exec,
+  spec: string,
   resolvedVersion: string | null,
 ): Promise<CanaryOutcome | null> {
   if (ctx.canary === null) return null;
@@ -127,39 +158,38 @@ async function runCanary(
   }
   const result = await exec.capture(
     'npx',
-    [...baseArgs(ctx), '--method', 'tools/call', '--tool-name', ctx.canary.tool, ...argFlags],
+    [...baseArgs(ctx, spec), '--method', 'tools/call', '--tool-name', ctx.canary.tool, ...argFlags],
     { cwd: ctx.workDir, timeoutMs: ctx.timeoutMs },
   );
-  if (result.code !== 0) {
-    return {
-      attempted: true,
-      detail: ctx.redact(excerpt(result.stderr === '' ? result.stdout : result.stderr)),
-      ok: false,
-    };
-  }
+  const failed = (detail: string): CanaryOutcome => ({ attempted: true, detail, ok: false });
+  if (result.timedOut) return failed(`timed out after ${ctx.timeoutMs}ms`);
+  const notStarted = spawnFailureDetail(ctx, result);
+  if (notStarted !== null) return failed(notStarted);
+  if (result.code !== 0) return failed(exitDetail(ctx, result));
   const parsed = CallToolOutput.safeParse(parseJsonLoose(result.stdout));
-  if (!parsed.success) {
-    return { attempted: true, detail: 'tools/call output was not parseable JSON', ok: false };
-  }
+  if (!parsed.success) return failed(unparsedDetail('tools/call', result));
   if (parsed.data.isError === true) {
     const first = parsed.data.content?.[0];
     const text = first !== undefined && typeof first.text === 'string' ? first.text : 'isError';
-    return {
-      attempted: true,
-      detail: ctx.redact(excerpt(`server rejected the call — ${text}`)),
-      ok: false,
-    };
+    return failed(excerpt(ctx.redact(`server rejected the call — ${text}`)));
   }
   return { attempted: true, detail: null, ok: true };
 }
 
+/**
+ * Classified in order: a timeout (`handshake-failure`), an npx that never
+ * started (`adapter-broken`), a non-zero exit (`adapter-broken` when npm could
+ * not install the client, `handshake-failure` otherwise), and an exit-0 output
+ * that did not parse (`capture-failure`).
+ */
 async function run(ctx: AdapterContext): Promise<AdapterRunResult> {
   const startedAt = Date.now();
   const exec = ctx.exec ?? nodeExec;
   const resolvedVersion = await resolveVersion(ctx, exec);
-  ctx.log(`inspector: resolved ${resolvedVersion ?? 'unknown version'}, listing tools`);
+  const spec = `${PACKAGE}@${resolvedVersion ?? 'latest'}`;
+  ctx.log(`inspector: running ${spec}, listing tools`);
 
-  const result = await exec.capture('npx', [...baseArgs(ctx), '--method', 'tools/list'], {
+  const result = await exec.capture('npx', [...baseArgs(ctx, spec), '--method', 'tools/list'], {
     cwd: ctx.workDir,
     timeoutMs: ctx.timeoutMs,
   });
@@ -171,27 +201,22 @@ async function run(ctx: AdapterContext): Promise<AdapterRunResult> {
       resolvedVersion,
       ...partial,
     }) satisfies AdapterRunResult;
+  const failed = (status: AdapterRunResult['status'], statusDetail: string) =>
+    finish({ canary: null, status, statusDetail, surface: null });
 
-  if (result.timedOut) {
-    return finish({
-      canary: null,
-      status: 'handshake-failure',
-      statusDetail: `timed out after ${ctx.timeoutMs}ms`,
-      surface: null,
-    });
-  }
-
-  const parsed = ListToolsOutput.safeParse(parseJsonLoose(result.stdout));
-  if (result.code !== 0 || !parsed.success) {
-    const stderr = ctx.redact(excerpt(result.stderr === '' ? result.stdout : result.stderr));
+  if (result.timedOut) return failed('handshake-failure', `timed out after ${ctx.timeoutMs}ms`);
+  const notStarted = spawnFailureDetail(ctx, result);
+  if (notStarted !== null) return failed('adapter-broken', notStarted);
+  if (result.code !== 0) {
     const installFailure = /npm (err|error)|E404|EOVERRIDE|ENOTFOUND/i.test(result.stderr);
-    return finish({
-      canary: null,
-      status: installFailure ? 'adapter-broken' : 'handshake-failure',
-      statusDetail: stderr === '' ? `exit code ${result.code}` : stderr,
-      surface: null,
-    });
+    const detail = exitDetail(ctx, result);
+    return failed(
+      installFailure ? 'adapter-broken' : 'handshake-failure',
+      detail === '' ? `exit code ${result.code}` : detail,
+    );
   }
+  const parsed = ListToolsOutput.safeParse(parseJsonLoose(result.stdout));
+  if (!parsed.success) return failed('capture-failure', unparsedDetail('tools/list', result));
 
   const surface: RenderedSurface = {
     tools: parsed.data.tools.map((tool) => {
@@ -207,7 +232,7 @@ async function run(ctx: AdapterContext): Promise<AdapterRunResult> {
     }),
   };
 
-  const canary = await runCanary(ctx, exec, resolvedVersion);
+  const canary = await runCanary(ctx, exec, spec, resolvedVersion);
   return finish({ canary, status: 'ok', statusDetail: null, surface });
 }
 
