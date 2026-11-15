@@ -13,7 +13,7 @@ bun install
 bun run devcheck   # the gate — run before declaring any work complete
 ```
 
-`devcheck` (`scripts/devcheck.ts`) runs Biome with `--write --error-on-warnings`, typecheck, build, the full test suite, the CHANGELOG-carries-current-version check, and the `dist/cli.js` shebang check. Warnings are failures. Run it raw — it auto-fixes formatting, so filtering its output hides what it changed.
+`devcheck` (`scripts/devcheck.ts`) runs Biome with `--write --error-on-warnings`, typecheck, build, the full test suite, the CHANGELOG-carries-current-version check, the `dist/cli.js` shebang check, and a check that `dist/launch-target.js` was built. Warnings are failures. Run it raw — it auto-fixes formatting, so filtering its output hides what it changed.
 
 Runtime code under `src/` must stay Node-compatible; Bun-only APIs belong in tests and `scripts/`.
 
@@ -24,10 +24,11 @@ Runtime code under `src/` must stay Node-compatible; Bun-only APIs belong in tes
 | `src/cli.ts` | Flag parsing, stderr progress, stdout report. Exit codes: 0 pass, 1 findings/runtime failure, 2 usage error |
 | `src/run.ts` | Orchestration: ground truth → canary preflight → each adapter → baseline reconciliation → report |
 | `src/ground-truth.ts` | The server's own surface, captured with the official MCP TypeScript SDK client |
+| `src/target.ts`, `src/launch-target.ts` | How a stdio target starts (command and arguments as given, SDK default environment plus `--env`, the caller's cwd), and the launcher every client runs in its place from a spec file in the run's scratch directory |
 | `src/schema.ts` | JSON Schema → the comparable `RenderedTool` / `RenderedProperty` model. Both sides normalize through here |
 | `src/invariants.ts` | Pure comparison. `fail` = breaks agents in the wild; `info` = recorded degradation |
 | `src/baseline.ts` | Strict v1 baseline parse, reconcile, atomic write |
-| `src/adapters/` | One file per client. `inspector` and `mcpo` run by default; `codex` and `claude-code` are opt-in and capture-only |
+| `src/adapters/` | One file per client. `inspector` and `mcpo` run by default; `codex` and `claude-code` are opt-in and capture-only, and share the loopback model stand-in in `model-intercept.ts` |
 | `src/util/exec.ts` | The `Exec` seam every adapter spawns through — the reason failure paths are testable without real clients |
 | `tests/fixture-server/` | Bundled adversarial MCP server (stdio + streamable HTTP) the E2E suite runs against |
 
@@ -56,11 +57,16 @@ Labels: primary `bug` / `enhancement` / `documentation`; secondary `engine` (inv
 
 Read `skills/git-wrapup/SKILL.md`. Version lands in `package.json` and a matching `## x.y.z` CHANGELOG heading — devcheck enforces the pair.
 
+## Publishing
+
+Every release goes through a gated release PR — "Release PR mode", mode `gated`. The commit stack and release metadata land on a `release/<version>` branch with a PR, a `release-pr-review` pass reviews the whole PR, and only then does `release-and-publish` fast-forward `main`, push the annotated tag cut on the reviewed head, publish to npm, and create the GitHub release.
+
 ## Decisions on record
 
 - **Info tier for output-schema drift.** A dropped output field can mislead a model about a result but drops no argument, so it never fails a run.
 - **Latest floats by default.** Adapters resolve their newest release unless pinned, and every run records the version it actually exercised — the drift being measured is a moving target.
 - **`claude-code` pins are exact-match, not install directives.** The adapter exercises the installed executable; a mismatched pin reports `adapter-broken` rather than silently testing a different client.
+- **Every client starts the target through one launcher.** Clients each apply `env`, `cwd`, and arguments their own way (Inspector rewrites `-e` and argv, Codex writes TOML keys, mcpo hands over its own environment), so a diff measured how the target launched as much as how the client rendered it. Handing every client the same launcher command line, with ground truth's exact launch in its spec, makes the launch identical by construction instead of by per-client escaping.
 - **The `Exec` seam is a test seam, not an abstraction layer.** It carries exactly the two calls `exec.ts` offers and should not grow to hide process details.
 - **Branch `required` never becomes an unconditional requirement.** A requirement inside an `anyOf`/`oneOf` branch holds only when that branch applies, so the normalizer excludes it by construction.
 - **`allOf` members merge structure, not values.** A member's `properties`, `required`, and `additionalProperties: false` belong to the level; its constraints, description, and type do not, because `allOf` combines them by conjunction and a merged value would make `constraint-altered` report an artifact of the merge rule. A one-member `allOf` is the exception: it is no conjunction but exactly its member, so the member also supplies values, with the wrapper's own keywords layered on top the way `$ref` siblings are. `{allOf: [{$ref}], description}` is the draft-7 and older-pydantic encoding of a described `$ref`.

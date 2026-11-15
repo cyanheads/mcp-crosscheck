@@ -4,7 +4,7 @@ description: >
   Land working-tree changes in mcp-crosscheck as a stack of logical commits, and cut a release when the work ships — gates, version sync, changelog, tag, and npm publish order.
 metadata:
   author: cyanheads
-  version: "1.0"
+  version: "1.1"
   audience: maintainer
   type: workflow
 ---
@@ -22,9 +22,9 @@ Exit 0 **and** zero warnings. Biome runs with `--error-on-warnings`, so a green 
 When the change touches an adapter's capture path, run its opt-in lane too — the hermetic suite cannot see a real client's rendering change:
 
 ```sh
-CROSSCHECK_E2E_NETWORK=1 bun test tests/e2e.test.ts      # inspector + mcpo, needs uv on PATH
-CROSSCHECK_E2E_CODEX=1 bun test tests/e2e.test.ts
-CROSSCHECK_E2E_CLAUDE_CODE=1 bun test tests/e2e.test.ts
+CROSSCHECK_E2E_NETWORK=1 bun test tests/e2e/inspector.test.ts tests/e2e/mcpo.test.ts      # inspector + mcpo, needs uv on PATH
+CROSSCHECK_E2E_CODEX=1 bun test tests/e2e/codex.test.ts
+CROSSCHECK_E2E_CLAUDE_CODE=1 bun test tests/e2e/claude-code.test.ts
 ```
 
 A validated client capture that changed also needs a dated measurement in `docs/adapters.md`.
@@ -42,6 +42,8 @@ No marketing adjectives, no references to the conversation that produced the cha
 ## Releasing
 
 A release is one commit stack plus metadata on top. For a single cohesive change the version bump rides with the work; for several distinct efforts the per-effort commits land first and `chore(release): <version> — <theme>` goes on top.
+
+Releases run in Release PR mode (`CLAUDE.md` § Publishing). Wrapup commits the stack on `release/<version>`, pushes the branch, opens the PR, and stops. Tagging, publishing, the GitHub release, and issue closure run after the review pass, so the tag lands on the reviewed head.
 
 1. **Version.** `package.json` `version`. The magnitude is the maintainer's call — never inferred.
 2. **CHANGELOG.** A new `## x.y.z — YYYY-MM-DD` heading, a one-line theme, then flat bullets naming the behavior change and its issue numbers. Never `[Unreleased]`. `devcheck` fails when the heading does not match `package.json`, so the pair moves together.
