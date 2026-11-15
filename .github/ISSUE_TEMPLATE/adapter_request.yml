@@ -2,6 +2,7 @@ name: Adapter request
 description: Propose a deterministic MCP client capture adapter
 title: "feat(adapter): "
 labels:
+  - enhancement
   - adapter
 assignees:
   - cyanheads

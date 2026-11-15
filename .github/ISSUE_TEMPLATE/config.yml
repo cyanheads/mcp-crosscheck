@@ -1,5 +1,8 @@
-blank_issues_enabled: false
+blank_issues_enabled: true
 contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/cyanheads/mcp-crosscheck/security/advisories/new
+    about: Private report — please don't file vulnerabilities as public issues
   - name: Usage and documentation
     url: https://github.com/cyanheads/mcp-crosscheck#readme
     about: Read the usage guide before filing an issue.

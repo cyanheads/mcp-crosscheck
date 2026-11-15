@@ -150,7 +150,7 @@ bun install
 bun run devcheck
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the local workflow, opt-in client lanes, and adapter constraints.
+Issues are the contribution path. See [CONTRIBUTING.md](.github/CONTRIBUTING.md) for filing a bug, feature, or adapter request, and for the opt-in client lanes; report vulnerabilities privately per [SECURITY.md](.github/SECURITY.md).
 
 All `--artifacts` output is local-sensitive. `ground-truth.json` and `mcpo.openapi.json` can contain server-controlled data; raw `codex.request.json` and `claude-code.request.json` can also contain prompt, session, and client metadata. Exact header-value redaction applies to the free text of crosscheck-owned diagnostics and reports, not to their structured fields, arbitrary server echoes, or raw captures.
 

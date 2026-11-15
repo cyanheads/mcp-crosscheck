@@ -40,6 +40,7 @@ Ground truth and every rendered surface flow through the same normalizer. A diff
 - A finding's identity is `adapter + rule + path + evidence`. Baselines persist exactly that, so any change to evidence shape is a baseline-compatibility change.
 - New invariant → new `RuleId` + `FindingEvidence` variant + a `RULE_FOR_KIND` row in `baseline.ts`, or the baseline round-trip rejects it. A rule that reads the advertised surface alone joins `GroundTruthRuleId` instead and gets no row: its notes are reported once, under `groundTruth.findings`, as info, and never baselined. Typecheck then requires its key in `GROUND_TRUTH_RULES`.
 - Adapters never call a model, never log in, and never reach a non-loopback endpoint. An adapter that cannot expose a surface without model traffic is out of scope.
+- Committed client request fixtures carry only the parser-relevant declaration payload, never a raw capture. A validated client capture that changes updates its parser coverage and adds a dated measurement to `docs/adapters.md`.
 - Header values are redacted from the free text of crosscheck-owned diagnostics and reports — not from raw captures or server echoes. Say so rather than implying full redaction. Rule ids, paths, evidence, names, and versions are never redacted: a short value such as `on` would rewrite the machine contract and every baseline written from it.
 - `--artifacts` output is local-sensitive. Never commit or attach it.
 
@@ -51,15 +52,21 @@ There are no GitHub Actions workflows and none should be added. `devcheck` runs 
 
 Read `skills/report-issue-local/SKILL.md` before `gh issue create`. Every issue is assigned to `cyanheads` at creation.
 
-Labels: primary `bug` / `enhancement` / `documentation`; secondary `engine` (invariant engine and schema comparison), `adapter` (client adapters), `ops` (auth, baselines, running-server usage), `test-infra` (fixture server, E2E suite).
+Labels: primary `bug` / `enhancement` / `documentation`; area `engine` (invariant engine and schema comparison), `adapter` (client adapters), `ops` (auth, baselines, running-server usage), `test-infra` (fixture server, E2E suite); cross-cutting `regression`, `performance`, `security`, `breaking-change`, `surplus-token-idea`.
+
+Community files live in `.github/`: `CONTRIBUTING.md` (issues are the contribution path), `CODE_OF_CONDUCT.md`, `SECURITY.md`, and the issue forms. `scripts/issue-forms.test.ts` pins the forms and the contributing guide's links to them, so a renamed form or heading fails the suite.
 
 ## Releasing
 
-Read `skills/git-wrapup/SKILL.md`. Version lands in `package.json` and a matching `## x.y.z` CHANGELOG heading — devcheck enforces the pair.
+Version lands in `package.json` and a matching `## x.y.z` CHANGELOG heading — devcheck enforces the pair.
 
 ## Publishing
 
-Every release goes through a gated release PR — "Release PR mode", mode `gated`. The commit stack and release metadata land on a `release/<version>` branch with a PR, a `release-pr-review` pass reviews the whole PR, and only then does `release-and-publish` fast-forward `main`, push the annotated tag cut on the reviewed head, publish to npm, and create the GitHub release.
+Every release goes through a gated release PR — "Release PR mode", mode `gated` — run by three skills in order, each a separate agent:
+
+1. `skills/git-wrapup/SKILL.md` commits the stack and release metadata on `release/<version>`, pushes the branch, opens the PR, and stops.
+2. `skills/release-pr-review/SKILL.md` reviews the whole PR and lands any fixes as ordinary commits on the branch.
+3. `skills/release-and-publish/SKILL.md` fast-forwards `main`, pushes the annotated tag cut on the reviewed head, publishes to npm, creates the GitHub release, and closes the resolved issues.
 
 ## Decisions on record
 

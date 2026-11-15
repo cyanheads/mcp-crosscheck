@@ -10,6 +10,16 @@ body:
     attributes:
       value: |
         For a new client capture adapter, use the **Adapter request** form instead — it collects the capture-boundary details this form does not.
+
+        **Secondary labels.** `enhancement` is applied automatically — also add one or more of the following in the sidebar if they apply:
+        - `engine` — invariant engine, schema normalization, findings, baselines
+        - `adapter` — a client adapter or its capture profile
+        - `ops` — auth, headers, baselines in CI, running-server usage
+        - `test-infra` — fixture server, E2E suite, test tooling
+        - `performance` — improves memory, CPU, latency, or resource usage
+        - `security` — hardens the security posture
+        - `breaking-change` — changes the library API, the report shape, or baseline identities
+        - `surplus-token-idea` — worth exploring when token budget allows
   - type: dropdown
     id: area
     attributes:

@@ -1,7 +1,8 @@
 import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 
-const templateDir = new URL('../.github/ISSUE_TEMPLATE/', import.meta.url);
+const githubDir = new URL('../.github/', import.meta.url);
+const templateDir = new URL('ISSUE_TEMPLATE/', githubDir);
 
 function readYaml(name: string): Record<string, unknown> {
   return Bun.YAML.parse(readFileSync(new URL(name, templateDir), 'utf8')) as Record<
@@ -15,6 +16,7 @@ function fields(form: Record<string, unknown>) {
     type: string;
     id?: string;
     attributes: Record<string, unknown>;
+    validations?: { required?: boolean };
   }>;
 }
 
@@ -36,10 +38,14 @@ describe('GitHub issue forms', () => {
   test('bug reports are reproducible and secret-safe', () => {
     const form = readYaml('bug_report.yml');
     const body = fields(form);
-    expectValidFields(form);
+    const ids = expectValidFields(form);
 
     expect(form.labels).toEqual(['bug']);
     expect(form.assignees).toEqual(['cyanheads']);
+    expect(ids).toEqual(
+      expect.arrayContaining(['description', 'reproduction', 'report', 'actual', 'expected']),
+    );
+    expect(body.find((field) => field.id === 'context')?.validations?.required).toBe(false);
     expect(body.find((field) => field.id === 'adapter')?.attributes.options).toContain(
       'Not adapter-specific',
     );
@@ -58,7 +64,7 @@ describe('GitHub issue forms', () => {
     const form = readYaml('adapter_request.yml');
     const ids = expectValidFields(form);
 
-    expect(form.labels).toEqual(['adapter']);
+    expect(form.labels).toEqual(['enhancement', 'adapter']);
     expect(form.assignees).toEqual(['cyanheads']);
     expect(ids).toEqual(
       expect.arrayContaining([
@@ -77,14 +83,31 @@ describe('GitHub issue forms', () => {
     );
   });
 
-  test('the chooser keeps only live routing', () => {
+  test('the chooser routes security reports privately and links no disabled surface', () => {
     const config = readYaml('config.yml');
     const links = config.contact_links as Array<{ url: string }>;
 
-    expect(config.blank_issues_enabled).toBe(false);
-    expect(links).toEqual([
-      expect.objectContaining({ url: 'https://github.com/cyanheads/mcp-crosscheck#readme' }),
+    expect(config.blank_issues_enabled).toBe(true);
+    expect(links.map((link) => link.url)).toEqual([
+      'https://github.com/cyanheads/mcp-crosscheck/security/advisories/new',
+      'https://github.com/cyanheads/mcp-crosscheck#readme',
     ]);
     expect(JSON.stringify(config)).not.toContain('discussions');
+  });
+
+  test('the contributing guide links every form, and the bug form links back to it', () => {
+    const contributing = readFileSync(new URL('CONTRIBUTING.md', githubDir), 'utf8');
+    const linked = [...contributing.matchAll(/issues\/new\?template=([\w-]+\.yml)/g)].map(
+      (match) => match[1],
+    );
+    const forms = readdirSync(templateDir).filter(
+      (name) => name.endsWith('.yml') && name !== 'config.yml',
+    );
+
+    expect(linked.toSorted()).toEqual(forms.toSorted());
+    expect(contributing).toMatch(/^## Before filing$/m);
+    expect(readFileSync(new URL('bug_report.yml', templateDir), 'utf8')).toContain(
+      '/.github/CONTRIBUTING.md#before-filing',
+    );
   });
 });

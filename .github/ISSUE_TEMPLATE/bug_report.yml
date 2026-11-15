@@ -9,7 +9,19 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for helping improve mcp-crosscheck. Replace credentials, auth headers, tokens, and private endpoints with placeholders. Raw `--artifacts` captures are local-sensitive and should not be uploaded.
+        Thanks for reporting a bug. A finding can be real server or client behavior that crosscheck reported correctly — if you're unsure, see the [before-filing steps](https://github.com/cyanheads/mcp-crosscheck/blob/main/.github/CONTRIBUTING.md#before-filing).
+
+        **Do not include secrets.** Replace credentials, auth headers, tokens, and private endpoints with placeholders. Raw `--artifacts` captures are local-sensitive and should not be uploaded. GitHub issues are public and permanent.
+
+        **Secondary labels.** `bug` is applied automatically — also add one or more of the following in the sidebar if they apply:
+        - `engine` — invariant engine, schema normalization, findings, baselines
+        - `adapter` — a client adapter or its capture profile
+        - `ops` — auth, headers, baselines in CI, running-server usage
+        - `test-infra` — fixture server, E2E suite, test tooling
+        - `regression` — worked before, broken after an update
+        - `performance` — memory, CPU, latency, or resource usage
+        - `security` — vulnerability or hardening work
+        - `breaking-change` — the fix changes the library API, the report shape, or baseline identities
   - type: input
     id: crosscheck_version
     attributes:
@@ -58,6 +70,14 @@ body:
     validations:
       required: true
   - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened and what you expected instead — two or three sentences. Name the rule, adapter, flag, or tool.
+      placeholder: Codex reports `tool-missing` for `search_docs`, but the tool appears in Codex's captured request.
+    validations:
+      required: true
+  - type: textarea
     id: reproduction
     attributes:
       label: Minimal reproduction
@@ -73,17 +93,26 @@ body:
     validations:
       required: true
   - type: textarea
-    id: expected
-    attributes:
-      label: Expected behavior
-    validations:
-      required: true
-  - type: textarea
     id: actual
     attributes:
       label: Actual behavior
+      description: The finding, status, or error as it appeared.
     validations:
       required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should have happened.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Only what changes the fix — a workaround, a related issue, the one log line that matters.
+    validations:
+      required: false
   - type: checkboxes
     id: redaction
     attributes:
