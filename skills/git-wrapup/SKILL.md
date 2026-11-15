@@ -4,7 +4,7 @@ description: >
   Land working-tree changes in mcp-crosscheck as a stack of logical commits, and cut a release when the work ships — gates, version sync, changelog, tag, and npm publish order.
 metadata:
   author: cyanheads
-  version: "1.1"
+  version: "1.2"
   audience: maintainer
   type: workflow
 ---
@@ -51,7 +51,7 @@ Releases run in Release PR mode (`CLAUDE.md` § Publishing). Wrapup commits the 
 4. **Commit, then tag.** Annotated tag `vX.Y.Z`. The annotation subject is the theme with **no version number** (GitHub prepends `vX.Y.Z:` to the release title), then flat bullets for the notable changes with issue backlinks. Terse — depth lives in the CHANGELOG.
 5. **Push** the commits and the tag.
 6. **Publish.** `npm publish` runs `prepublishOnly` → `bun run rebuild`, so the tarball is built from a clean `dist/`. The package ships `dist/` and `CHANGELOG.md` only.
-7. **GitHub release** from the tag: `gh release create vX.Y.Z --notes-from-tag`.
+7. **GitHub release** from the tag: `gh release create vX.Y.Z --notes-from-tag --title "vX.Y.Z: <tag subject>"`. Without `--title` the release name is empty.
 8. **Close the issues** the release resolved, with a one-line note on what landed.
 
 ## Boundaries
