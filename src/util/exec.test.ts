@@ -2,9 +2,11 @@
  * @file src/util/exec.test.ts
  * Tests for the process helpers: output compression (findings and status
  * details must stay one bounded line, whatever a child prints), the timeout
- * path that feeds `handshake-failure` classification, process-group teardown
- * of descendants that outlive their leader, and UTF-8 decoding across pipe
- * chunks. Windows paths run through the platform-parameterized seam only.
+ * path that feeds `handshake-failure` classification, commands that never
+ * start (thrown or emitted spawn failures), the stdout capture limit,
+ * process-group teardown of descendants that outlive their leader, and UTF-8
+ * decoding across pipe chunks. Windows paths run through the
+ * platform-parameterized seam only.
  */
 import { describe, expect, test } from 'bun:test';
 import type { ChildProcess, SpawnOptions as NodeSpawnOptions } from 'node:child_process';
@@ -230,6 +232,161 @@ describe('execCapture', () => {
   });
 });
 
+/** Shaped like what `spawn` throws when the OS refuses the command outright, in Node's wording. */
+function syncSpawnFailure(code: string): NodeJS.ErrnoException {
+  return Object.assign(new Error(`spawn ${code}`), { code, syscall: 'spawn' });
+}
+
+/** The error a child emits when its command cannot be found, as Node words it. */
+function asyncSpawnFailure(): NodeJS.ErrnoException {
+  return Object.assign(new Error('spawn client ENOENT'), {
+    code: 'ENOENT',
+    path: 'client',
+    syscall: 'spawn client',
+  });
+}
+
+/** An `Exec` whose every spawn throws `error`, recording each spawned command and signalled PID. */
+function throwingSpawnExec(platform: NodeJS.Platform, error: Error) {
+  const signals: number[] = [];
+  const spawned: string[] = [];
+  const exec = createNodeExec({
+    execPath: 'C:\\Program Files\\nodejs\\node.exe',
+    kill: ((pid: number) => {
+      signals.push(pid);
+      return true;
+    }) as typeof process.kill,
+    platform,
+    spawn: (command) => {
+      spawned.push(command);
+      throw error;
+    },
+  });
+  return { exec, signals, spawned };
+}
+
+describe('commands that never start', () => {
+  test('capture reports an asynchronous spawn error as spawnErrorCode with its text', async () => {
+    const child = fakeChild(undefined);
+    const pending = createNodeExec({
+      kill: () => true,
+      platform: 'linux',
+      spawn: () => child,
+    }).capture('client', [], { timeoutMs: 30_000 });
+    child.emit('error', asyncSpawnFailure());
+    expect(await pending).toEqual({
+      code: null,
+      signal: null,
+      spawnErrorCode: 'ENOENT',
+      stderr: 'Error: spawn client ENOENT',
+      stdout: '',
+      timedOut: false,
+    });
+  });
+
+  test('a managed child whose spawn fails asynchronously settles with spawnErrorCode and its text', async () => {
+    const child = fakeChild(undefined);
+    const managed = createNodeExec({
+      kill: () => true,
+      platform: 'linux',
+      spawn: () => child,
+    }).spawn('client', [], {});
+    child.emit('error', asyncSpawnFailure());
+    expect(await managed.exited).toEqual({ code: null, signal: null, spawnErrorCode: 'ENOENT' });
+    expect(managed.hasExited()).toBe(true);
+    expect(managed.stderrTail()).toBe('Error: spawn client ENOENT');
+    expect(managed.stdoutTail()).toBe('');
+  });
+
+  test('a managed command not on PATH settles with ENOENT and names the command', async () => {
+    const managed = nodeExec.spawn('crosscheck-no-such-command', [], {
+      env: { PATH: import.meta.dir },
+      inheritEnv: false,
+    });
+    expect(await managed.exited).toEqual({ code: null, signal: null, spawnErrorCode: 'ENOENT' });
+    expect(managed.hasExited()).toBe(true);
+    expect(managed.stderrTail()).toContain('crosscheck-no-such-command');
+  });
+
+  for (const platform of ['linux', 'win32'] as const) {
+    test(`${platform}: capture resolves a synchronous OS spawn failure instead of rejecting`, async () => {
+      for (const code of ['E2BIG', 'ENAMETOOLONG']) {
+        const harness = throwingSpawnExec(platform, syncSpawnFailure(code));
+        expect(await harness.exec.capture('client', ['--flag'], { timeoutMs: 5 })).toEqual({
+          code: null,
+          signal: null,
+          spawnErrorCode: code,
+          stderr: `Error: spawn ${code}`,
+          stdout: '',
+          timedOut: false,
+        });
+        expect(harness.spawned).toEqual(['client']);
+        expect(harness.signals).toEqual([]);
+      }
+    });
+
+    test(`${platform}: spawn returns a settled child for a synchronous OS spawn failure`, async () => {
+      for (const code of ['E2BIG', 'ENAMETOOLONG']) {
+        const harness = throwingSpawnExec(platform, syncSpawnFailure(code));
+        const managed = harness.exec.spawn('client', ['--flag'], {});
+        expect(managed.hasExited()).toBe(true);
+        expect(await managed.exited).toEqual({ code: null, signal: null, spawnErrorCode: code });
+        expect(managed.stderrTail()).toBe(`Error: spawn ${code}`);
+        expect(managed.stdoutTail()).toBe('');
+        // Nothing started, so teardown has no process tree to reach: no signal, no taskkill.
+        managed.kill();
+        expect(harness.spawned).toEqual(['client']);
+        expect(harness.signals).toEqual([]);
+      }
+    });
+  }
+
+  test('a synchronous error that is not a spawn failure still throws from both calls', async () => {
+    // A NUL byte fails argument validation before any spawn syscall: a caller bug, not a missing client.
+    const args = ['-e', 'nul\0byte'];
+    const invalid = { code: 'ERR_INVALID_ARG_VALUE', name: 'TypeError' };
+    await expect(execCapture(process.execPath, args, { timeoutMs: 30_000 })).rejects.toMatchObject(
+      invalid,
+    );
+    let thrown: unknown;
+    try {
+      spawnManaged(process.execPath, args, {});
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toMatchObject(invalid);
+  });
+
+  test('an injected error without the spawn syscall still throws from both calls', async () => {
+    const notSpawn = Object.assign(new Error('kill EPERM'), { code: 'EPERM', syscall: 'kill' });
+    const harness = throwingSpawnExec('linux', notSpawn);
+    await expect(harness.exec.capture('client', [], { timeoutMs: 5 })).rejects.toBe(notSpawn);
+    expect(() => harness.exec.spawn('client', [], {})).toThrow(notSpawn);
+  });
+
+  test.skipIf(process.platform === 'win32')(
+    'a real oversized argument list reports E2BIG from both calls',
+    async () => {
+      // Past ARG_MAX on macOS (1 MiB) and the single-argument limit on Linux (128 KiB).
+      const args = ['-e', 'x'.repeat(4_000_000)];
+      const result = await execCapture(process.execPath, args, { timeoutMs: 30_000 });
+      expect(result).toMatchObject({
+        code: null,
+        signal: null,
+        spawnErrorCode: 'E2BIG',
+        stdout: '',
+        timedOut: false,
+      });
+      expect(result.stderr).toContain('E2BIG');
+
+      const managed = spawnManaged(process.execPath, args, {});
+      expect(await managed.exited).toEqual({ code: null, signal: null, spawnErrorCode: 'E2BIG' });
+      expect(managed.hasExited()).toBe(true);
+      expect(managed.stderrTail()).toContain('E2BIG');
+    },
+  );
+});
+
 /** Every character here is multibyte in UTF-8 except the ASCII ones, and the emoji is a surrogate pair. */
 const MULTIBYTE = 'café — 😀 ✓';
 
@@ -278,6 +435,60 @@ describe('UTF-8 output across pipe chunks', () => {
     expect(tail.length).toBe(64 * 1024 - 1);
     expect(tail.codePointAt(0)).toBe(0x1f600);
     expect(tail.endsWith('😀!')).toBe(true);
+  });
+});
+
+/** The capture limit, in UTF-16 code units: 2 MiB of ASCII, but twice that many bytes of `é`. */
+const CAPTURE_LIMIT = 2 * 1024 * 1024;
+/** Half the limit in code units, which is the whole limit in UTF-8 bytes. */
+const HALF_LIMIT_OF_E = Buffer.from('é'.repeat(CAPTURE_LIMIT / 2), 'utf8');
+
+describe('stdout capture limit', () => {
+  /** Capture through a fake child that writes `chunks` to stdout, one read each, then exits 0. */
+  function captureChunks(...chunks: (string | Buffer)[]) {
+    const child = fakeChild(2468);
+    const pending = createNodeExec({
+      kill: () => true,
+      platform: 'linux',
+      spawn: () => child,
+    }).capture('client', [], { timeoutMs: 30_000 });
+    for (const chunk of chunks) (child.stdout as PassThrough).write(chunk);
+    exitAfterWriting(child, 'stdout', '');
+    return pending;
+  }
+
+  test('output well below the limit is captured whole and not marked truncated', async () => {
+    const result = await captureChunks('café — ✓\n', 'second read\n');
+    expect(result.stdout).toBe('café — ✓\nsecond read\n');
+    expect(result).not.toHaveProperty('stdoutTruncated');
+  });
+
+  test('the limit counts UTF-16 code units: output exactly at it is captured whole', async () => {
+    expect(HALF_LIMIT_OF_E.length).toBe(CAPTURE_LIMIT);
+    const result = await captureChunks(HALF_LIMIT_OF_E, HALF_LIMIT_OF_E);
+    expect(result.stdout.length).toBe(CAPTURE_LIMIT);
+    // Twice the limit in bytes was kept: a byte count would have dropped the second read.
+    expect(Buffer.byteLength(result.stdout, 'utf8')).toBe(2 * CAPTURE_LIMIT);
+    expect(result).not.toHaveProperty('stdoutTruncated');
+  });
+
+  test('one code unit past the limit is discarded and marks stdout truncated', async () => {
+    const result = await captureChunks(HALF_LIMIT_OF_E, HALF_LIMIT_OF_E, 'é');
+    expect(result.stdout.length).toBe(CAPTURE_LIMIT);
+    expect(Buffer.byteLength(result.stdout, 'utf8')).toBe(2 * CAPTURE_LIMIT);
+    expect(result.stdoutTruncated).toBe(true);
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: '', timedOut: false });
+  });
+
+  test('a real child writing past the limit returns its exit with stdout marked truncated', async () => {
+    const result = await execCapture(
+      process.execPath,
+      ['-e', `process.stdout.write('x'.repeat(${3 * 1024 * 1024}))`],
+      { timeoutMs: 30_000 },
+    );
+    expect(result).toMatchObject({ code: 0, signal: null, stdoutTruncated: true, timedOut: false });
+    expect(result.stdout.length).toBeGreaterThanOrEqual(CAPTURE_LIMIT);
+    expect(result.stdout.length).toBeLessThan(3 * 1024 * 1024);
   });
 });
 

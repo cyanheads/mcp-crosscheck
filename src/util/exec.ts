@@ -6,7 +6,9 @@
  * timeout or kill while the leader runs, and the moment the leader exits, when
  * anything it left in the group is an orphan. Output is decoded as UTF-8 across
  * pipe chunks, and no call waits on a pipe past `PIPE_DRAIN_GRACE_MS` after
- * its child exits, whoever still holds it.
+ * its child exits, whoever still holds it. A command that never starts ends
+ * with `spawnErrorCode` whether the OS refusal is thrown by `spawn` or emitted
+ * as `error`.
  *
  * The `Exec` interface is the injection seam for all of it: adapters resolve
  * `ctx.exec ?? nodeExec`, so tests substitute fakes and never spawn processes.
@@ -18,10 +20,14 @@ import {
 } from 'node:child_process';
 import { win32 as win32Path } from 'node:path';
 
-/** Cap captured output so a runaway child cannot exhaust memory. */
-const MAX_CAPTURE_BYTES = 2 * 1024 * 1024;
-/** Keep this much recent output for error reporting on managed children. */
-const TAIL_BYTES = 64 * 1024;
+/**
+ * Cap captured output so a runaway child cannot exhaust memory. Counts UTF-16
+ * code units (`string.length`), not bytes. Each read is kept whole while the
+ * capture is under the cap, so a capture can pass it by up to one read.
+ */
+const MAX_CAPTURE_CODE_UNITS = 2 * 1024 * 1024;
+/** Keep this many UTF-16 code units of recent output for error reporting on managed children. */
+const TAIL_CODE_UNITS = 64 * 1024;
 /**
  * How long a child's pipes may stay open after it exits. A descendant beyond
  * teardown's reach (one that left the process group on POSIX, or any
@@ -30,13 +36,30 @@ const TAIL_BYTES = 64 * 1024;
  */
 const PIPE_DRAIN_GRACE_MS = 1_000;
 
-export interface ExecResult {
+/**
+ * How a child ended. A command that never started has a null `code` and
+ * `signal` and carries `spawnErrorCode`.
+ */
+export interface ChildExit {
   code: number | null;
   signal: NodeJS.Signals | null;
-  /** The command never started: the spawn error's code, such as `ENOENT` for a command not on PATH. */
+  /**
+   * The command never started: the spawn error's code, such as `ENOENT` for a
+   * command not on PATH or `E2BIG` for an argument list the OS refuses.
+   */
   spawnErrorCode?: string;
+}
+
+export interface ExecResult extends ChildExit {
+  /** Captured stderr, or the spawn error's text for a command that never started. */
   stderr: string;
   stdout: string;
+  /**
+   * Set when stdout reached the capture cap (`MAX_CAPTURE_CODE_UNITS`: 2 Mi
+   * UTF-16 code units, not bytes) and a later read was discarded, so `stdout`
+   * holds only the start of the output.
+   */
+  stdoutTruncated?: true;
   timedOut: boolean;
 }
 
@@ -138,34 +161,55 @@ export function killTree(
   }
 }
 
+/** An OS refusal that `spawn` throws (`E2BIG`, `ENAMETOOLONG`) rather than emits as `error`. */
+function isSyncSpawnFailure(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && 'syscall' in error && error.syscall === 'spawn';
+}
+
+/**
+ * Start the child, detached into its own process group on POSIX. An OS refusal
+ * that `spawn` throws is returned instead, for the caller to report as a
+ * command that never started. Any other throw, such as an invalid argument,
+ * is a caller bug and propagates.
+ */
 function spawnDetached(
   command: string,
   args: string[],
   opts: SpawnOptions,
   dependencies: NodeExecDependencies,
-): ChildProcess {
+): ChildProcess | NodeJS.ErrnoException {
   const resolved = resolveSpawnCommand(command, args, dependencies.platform, dependencies.execPath);
-  return dependencies.spawn(resolved.command, resolved.args, {
-    ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
-    detached: dependencies.platform !== 'win32',
-    env: opts.inheritEnv === false ? (opts.env ?? {}) : { ...process.env, ...opts.env },
-    shell: false,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  try {
+    return dependencies.spawn(resolved.command, resolved.args, {
+      ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
+      detached: dependencies.platform !== 'win32',
+      env: opts.inheritEnv === false ? (opts.env ?? {}) : { ...process.env, ...opts.env },
+      shell: false,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (error) {
+    if (isSyncSpawnFailure(error)) return error;
+    throw error;
+  }
 }
 
-interface ChildExit {
-  code: number | null;
-  signal: NodeJS.Signals | null;
+/** The end of a command whose spawn failed, however the failure arrived. */
+function notStarted(error: NodeJS.ErrnoException): ChildExit {
+  return {
+    code: null,
+    signal: null,
+    ...(error.code === undefined ? {} : { spawnErrorCode: error.code }),
+  };
 }
 
 /**
  * Report a child's end exactly once: on `close`, when every holder of its pipes
- * is gone, or `PIPE_DRAIN_GRACE_MS` after the leader exits, when a descendant
- * beyond reach still holds them and they are cut instead. On POSIX the leader's
- * exit also SIGKILLs its process group, since anything it left there is an
- * orphan. The group ID stays reserved while any member lives, so this is the
- * last moment it is known to name only this child's descendants.
+ * is gone; on `error`, as a command that never started; or
+ * `PIPE_DRAIN_GRACE_MS` after the leader exits, when a descendant beyond reach
+ * still holds the pipes and they are cut instead. On POSIX the leader's exit
+ * also SIGKILLs its process group, since anything it left there is an orphan.
+ * The group ID stays reserved while any member lives, so this is the last
+ * moment it is known to name only this child's descendants.
  */
 function superviseExit(
   child: ChildProcess,
@@ -203,12 +247,12 @@ function superviseExit(
     );
   });
   child.on('close', (code, signal) => end({ code, signal }));
-  child.on('error', (error) => end({ code: null, signal: null }, error));
+  child.on('error', (error) => end(notStarted(error), error));
 }
 
-/** The last `TAIL_BYTES` of `text`, never opening on the second half of a surrogate pair. */
+/** The last `TAIL_CODE_UNITS` of `text`, never opening on the second half of a surrogate pair. */
 function keepTail(text: string): string {
-  const kept = text.slice(-TAIL_BYTES);
+  const kept = text.slice(-TAIL_CODE_UNITS);
   const first = kept.charCodeAt(0);
   return first >= 0xdc00 && first <= 0xdfff ? kept.slice(1) : kept;
 }
@@ -221,15 +265,21 @@ function execCaptureWith(
 ): Promise<ExecResult> {
   return new Promise((resolve) => {
     const child = spawnDetached(command, args, opts, dependencies);
+    if (child instanceof Error) {
+      resolve({ ...notStarted(child), stderr: String(child), stdout: '', timedOut: false });
+      return;
+    }
     let stdout = '';
     let stderr = '';
+    let stdoutTruncated = false;
     let timedOut = false;
 
     child.stdout?.setEncoding('utf8').on('data', (chunk: string) => {
-      if (stdout.length < MAX_CAPTURE_BYTES) stdout += chunk;
+      if (stdout.length < MAX_CAPTURE_CODE_UNITS) stdout += chunk;
+      else stdoutTruncated = true;
     });
     child.stderr?.setEncoding('utf8').on('data', (chunk: string) => {
-      if (stderr.length < MAX_CAPTURE_BYTES) stderr += chunk;
+      if (stderr.length < MAX_CAPTURE_CODE_UNITS) stderr += chunk;
     });
 
     // The budget bounds the command itself; once it exits, the drain grace bounds the rest.
@@ -239,14 +289,13 @@ function execCaptureWith(
     }, opts.timeoutMs);
     child.on('exit', () => clearTimeout(timer));
 
-    superviseExit(child, dependencies, ({ code, signal }, error) => {
+    superviseExit(child, dependencies, (exit, error) => {
       clearTimeout(timer);
       resolve({
-        code,
-        signal,
-        ...(error?.code === undefined ? {} : { spawnErrorCode: error.code }),
+        ...exit,
         stderr: error === null ? stderr : String(error),
         stdout,
+        ...(stdoutTruncated ? { stdoutTruncated } : {}),
         timedOut,
       });
     });
@@ -260,6 +309,16 @@ function spawnManagedWith(
   dependencies: NodeExecDependencies,
 ): ManagedProcess {
   const child = spawnDetached(command, args, opts, dependencies);
+  if (child instanceof Error) {
+    const text = String(child);
+    return {
+      exited: Promise.resolve(notStarted(child)),
+      hasExited: () => true,
+      kill: () => {},
+      stderrTail: () => text,
+      stdoutTail: () => '',
+    };
+  }
   let stdoutTail = '';
   let stderrTail = '';
   let ended = false;
@@ -272,8 +331,9 @@ function spawnManagedWith(
   });
 
   const exited = new Promise<ChildExit>((resolve) => {
-    superviseExit(child, dependencies, (exit) => {
+    superviseExit(child, dependencies, (exit, error) => {
       ended = true;
+      if (error !== null) stderrTail = String(error);
       resolve(exit);
     });
   });
@@ -310,10 +370,14 @@ export function execCapture(
 }
 
 export interface ManagedProcess {
-  /** Settles when the child's pipes close, or within `PIPE_DRAIN_GRACE_MS` of its exit. */
-  exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+  /**
+   * Settles when the child's pipes close, or within `PIPE_DRAIN_GRACE_MS` of
+   * its exit. A command that never started settles it with `spawnErrorCode`.
+   */
+  exited: Promise<ChildExit>;
   hasExited: () => boolean;
   kill: () => void;
+  /** Recent stderr, or the spawn error's text for a command that never started. */
   stderrTail: () => string;
   stdoutTail: () => string;
 }
