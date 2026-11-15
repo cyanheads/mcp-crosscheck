@@ -42,8 +42,8 @@ Exit codes: `0` pass, `1` findings or runtime failure, `2` usage error.
 
 | Tier | Findings |
 |:--|:--|
-| **fail** | Missing tools or input properties; input properties a rendered `additionalProperties: false` excludes; empty request bodies; properties that lose their advertised type information or change their explicit type; descriptions rendered missing or blank; lost `required` markers; adapter launch, MCP handshake, or canary failures; a `tools/list` walk that stops before the server's last page |
-| **info** | Dropped constraints such as `enum`, `minimum`, and `pattern`, or changed constraint values; truncated or rewritten descriptions; ignored root `anyOf`/`oneOf`; missing, untyped, or explicitly retyped `outputSchema` fields; a root `$schema` naming a dialect the MCP TypeScript SDK v2 client does not recognize (anything but 2020-12, 2019-09, draft-07, and draft-06; it rejects every call to a tool whose `outputSchema` declares one); a tool definition that clients on `@modelcontextprotocol/sdk` 1.x reject, such as a boolean property schema or a non-object `outputSchema` root, which makes them reject the whole `tools/list` result |
+| **fail** | Missing tools or input properties; input properties a rendered `additionalProperties: false` excludes; empty request bodies; properties that lose their advertised type information or change their explicit type; descriptions rendered missing or blank; lost `required` markers; adapter launch, MCP handshake, or canary failures; client output crosscheck cannot read, such as a capture that does not parse or that runs past the capture limit; a `tools/list` walk that stops before the server's last page |
+| **info** | Tool names a client rewrites, matched to the advertised tool and compared under its name; dropped constraints such as `enum`, `minimum`, and `pattern`, or changed constraint values; truncated or rewritten descriptions; ignored root `anyOf`/`oneOf`; missing, untyped, or explicitly retyped `outputSchema` fields; a root `$schema` naming a dialect the MCP TypeScript SDK v2 client does not recognize (anything but 2020-12, 2019-09, draft-07, and draft-06; it rejects every call to a tool whose `outputSchema` declares one); a tool definition that clients on `@modelcontextprotocol/sdk` 1.x reject, such as a boolean property schema or a non-object `outputSchema` root, which makes them reject the whole `tools/list` result |
 
 Input checks recurse through nested objects and array items, including fields declared in `allOf` members and `anyOf`/`oneOf` branches. When an adapter exposes a result model, output-schema drift stays informational because it can mislead a model about a result but does not drop an argument.
 
@@ -64,12 +64,12 @@ The optional canary uses one tool and the exact arguments you provide. Crosschec
 | [Codex CLI](https://github.com/openai/codex) | no | stdio, HTTP | Converted function schemas from a local provider intercept; capture-only |
 | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | no | stdio | Converted input schemas from an isolated local base-URL intercept; capture-only |
 
-Codex runs with a clean environment and throwaway `HOME`/`CODEX_HOME`. HTTP header values reach Codex through generated environment-variable names referenced by its isolated TOML. Claude Code runs with isolated `HOME` and `CLAUDE_CONFIG_DIR`, `--bare`, dummy auth, and a loopback-only model endpoint. Both stop after the tools-bearing request is captured, without logging in or contacting a model service. See [adapter profiles and frozen measurements](docs/adapters.md) for the tested versions and schema evidence.
+Codex runs with a clean environment and throwaway `HOME`/`CODEX_HOME`. Beyond `PATH`, it takes only npm's cache directory from your setup, where a `--version` prime run with your npm configuration has installed the release. HTTP header values reach Codex through generated environment-variable names referenced by its isolated TOML. Claude Code runs with isolated `HOME` and `CLAUDE_CONFIG_DIR`, `--bare`, dummy auth, and a loopback-only model endpoint. Both stop after the tools-bearing request is captured, without logging in or contacting a model service. See [adapter profiles and frozen measurements](docs/adapters.md) for the tested versions and schema evidence.
 
-Package-backed adapters resolve their latest release by default. Claude Code exercises the installed `claude` executable (on Windows, the native installer's `claude.exe`) and reports its actual version. A `claude-code` pin is an exact requirement: the adapter reports `adapter-broken` without launching when the installed version differs. Pin versions when you need a fixed comparison:
+Package-backed adapters resolve their latest release by default: an unpinned run asks the registry once, spawns that exact release for every invocation, and the report names it. Claude Code exercises the installed `claude` executable (on Windows, the native installer's `claude.exe`) and reports its actual version. A `claude-code` pin is an exact requirement: the adapter reports `adapter-broken` without launching when the installed version differs. Pin versions when you need a fixed comparison:
 
 ```sh
-mcp-crosscheck --pin mcpo=0.0.20 --mcpo-with 'mcp<2' -- node ./dist/index.js
+mcp-crosscheck --pin mcpo=0.0.20 -- node ./dist/index.js
 ```
 
 ## CLI
@@ -83,10 +83,10 @@ mcp-crosscheck --http <url> [flags]               # streamable HTTP
 |:--|:--|
 | `--adapters <a,b,c>` | Select adapters. Default: `inspector,mcpo`. |
 | `--canary '<tool>={json}'` | Round-trip one safe tool with exact arguments. |
-| `--env <K=V>` | Add an environment variable to the stdio server. Repeatable; stdio only. |
+| `--env <K=V>` | Add an environment variable to the stdio server, the same for ground truth and every client. Variables from your shell do not reach it. Repeatable; stdio only. |
 | `--header <Name: value>` | Add an HTTP target header. Repeatable; `--http` only. |
-| `--pin <name=version>` | Pin an adapter version. Repeatable. |
-| `--mcpo-with <spec>` | Add an `uvx --with` constraint for mcpo. Repeatable. |
+| `--pin <name=version>` | Pin an adapter version. Repeatable, once per adapter. |
+| `--mcpo-with <spec>` | Add an `uvx --with` constraint for mcpo. Repeatable. mcpo runs with `mcp<2` and `fastapi<0.145` by default; an entry naming either package replaces that default. |
 | `--artifacts <dir>` | Save ground truth, raw adapter captures, and `report.json`. |
 | `--timeout <seconds>` | Set the per-stage timeout, from `0.001` to `2147483.647` (the Node timer limit). Default: `120`. |
 | `--baseline <file>` | Acknowledge matching reviewed rendering drift from a strict v1 baseline. |
@@ -101,7 +101,7 @@ Every `--json` document carries `reportVersion: 1`. Besides the per-adapter resu
 
 ## Baselines
 
-A baseline acknowledges rendering drift you have reviewed. It does not suppress adapter startup, handshake, canary, ground-truth, or run failures.
+A baseline acknowledges rendering drift you have reviewed. It does not suppress adapter startup, handshake, capture, canary, ground-truth, or run failures.
 
 ```sh
 # create or refresh reviewed entries after an eligible run
@@ -128,14 +128,18 @@ const report = await runCrosscheck({
 console.log(report.pass, report.failCount);
 ```
 
-For stdio targets, command and argument tokens beginning with `./` or `../` (and `.\` or `..\`
-on Windows) are resolved lexically against the invoking process's current directory. Adapters
-still run their package runners from a neutral scratch directory so local manifests cannot shadow
-the selected client.
+A stdio target starts the same way for ground truth and for every client. Clients start a small
+launcher in its place, and the launcher runs the target with its command and arguments as given,
+in the invoking process's current directory, with the MCP SDK's default environment plus each
+`env` value and nothing else from the invoking shell. A relative path resolves against the
+directory crosscheck runs from. The clients themselves run from a scratch directory, so local
+manifests cannot shadow the selected client. The launcher reads the target's environment from a
+file only the current user can read, inside that directory, which is removed when the run ends.
+A client killed before it can stop the target leaves the launcher to stop it.
 
 Caller mistakes reject with `CrosscheckUsageError` before any process starts: an unknown or
-repeated adapter name, a pin for an unknown adapter, an HTTP target URL that is not `http:` or
-`https:`, or a `timeoutMs` outside 1 to 2147483647.
+repeated adapter name, a pin for an unknown adapter or a blank pin, an HTTP target URL that is not
+`http:` or `https:`, or a `timeoutMs` outside 1 to 2147483647.
 
 The package also exports the ground-truth capture, schema normalizers, comparison engine, adapter parsers, and report renderers.
 

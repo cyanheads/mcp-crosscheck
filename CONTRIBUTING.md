@@ -22,9 +22,9 @@ bun run devcheck
 The default suite does not download or invoke external MCP clients. Run an opt-in lane when changing its adapter or capture profile:
 
 ```sh
-CROSSCHECK_E2E_NETWORK=1 bun test tests/e2e.test.ts
-CROSSCHECK_E2E_CODEX=1 bun test tests/e2e.test.ts
-CROSSCHECK_E2E_CLAUDE_CODE=1 bun test tests/e2e.test.ts
+CROSSCHECK_E2E_NETWORK=1 bun test tests/e2e/inspector.test.ts tests/e2e/mcpo.test.ts
+CROSSCHECK_E2E_CODEX=1 bun test tests/e2e/codex.test.ts
+CROSSCHECK_E2E_CLAUDE_CODE=1 bun test tests/e2e/claude-code.test.ts
 ```
 
 - `CROSSCHECK_E2E_NETWORK` exercises Inspector and mcpo at their resolved releases; mcpo requires `uv` on `PATH`.
