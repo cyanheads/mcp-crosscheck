@@ -212,7 +212,7 @@ describe('inspector orchestration', () => {
 const STRING_CANARY: CanarySpec = { args: { message: 'probe' }, tool: 'echo_message' };
 
 describe.skipIf(!NETWORK_LANES)('inspector lane', () => {
-  test('resolves the relative fixture target before the neutral-cwd adapter run', async () => {
+  test('runs an explicit-relative fixture target as given while Inspector runs from the scratch directory', async () => {
     const result = await runCli(
       [
         '--adapters',
