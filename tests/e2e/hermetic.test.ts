@@ -1,68 +1,61 @@
 /**
- * @file tests/e2e.test.ts
- * End-to-end lanes against the bundled fixture server, layered by cost:
- *
- *   1. hermetic core — the programmatic API over stdio and streamable-http
- *   2. CLI process   — the real CLI: help, version, usage exit codes
- *   3. inspector     — CROSSCHECK_E2E_NETWORK=1 (npx resolves the client)
- *   4. mcpo          — CROSSCHECK_E2E_NETWORK=1 and `uv` on PATH
- *   5. codex         — CROSSCHECK_E2E_CODEX=1 (boots the full Codex binary)
- *   6. claude-code   — CROSSCHECK_E2E_CLAUDE_CODE=1 (installed Claude Code)
- *
- * Lanes 1 and 2 are what a bare `bun test` runs: no network, no binaries beyond
- * bun itself. The gated lanes resolve their clients at latest, so they belong in
- * a deliberate run rather than the default suite.
- *
- * Explicit-relative stdio targets are resolved at the orchestration boundary.
- * Adapter package runners still launch from a neutral scratch cwd.
+ * @file tests/e2e/hermetic.test.ts
+ * Hermetic core lane: the programmatic API against the bundled fixture server
+ * over stdio and streamable-http — ground truth, target launch, pagination,
+ * canary, SDK v1 rejects, and orchestration with stand-in clients. No network and
+ * no binaries beyond bun. Run: `bun test tests/e2e/hermetic.test.ts`. Shared
+ * constants and the lane overview live in `tests/e2e/harness.ts`.
  */
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 
+import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import {
+  getDefaultEnvironment,
+  StdioClientTransport,
+} from '@modelcontextprotocol/sdk/client/stdio.js';
 import {
   captureGroundTruth,
   runGroundTruthCanary,
   terminateGroundTruthSession,
-} from '../src/ground-truth.js';
-import { compareSurface } from '../src/invariants.js';
-import { renderHumanReport, toJsonReport } from '../src/report.js';
+} from '../../src/ground-truth.js';
+import { compareSurface } from '../../src/invariants.js';
+import { renderHumanReport, toJsonReport } from '../../src/report.js';
 import {
   type CrosscheckOptions,
   CrosscheckUsageError,
   MAX_TIMEOUT_MS,
   runCrosscheck,
-} from '../src/run.js';
-import { renderedPropertiesFromJsonSchema, renderedToolFromJsonSchema } from '../src/schema.js';
+} from '../../src/run.js';
+import { renderedPropertiesFromJsonSchema, renderedToolFromJsonSchema } from '../../src/schema.js';
 import type {
   AdapterName,
   CanarySpec,
-  ErrorReport,
   GroundTruth,
   RenderedSurface,
   RunReport,
   TargetSpec,
-} from '../src/types.js';
-import { type Exec, type ExecResult, execCapture, spawnManaged } from '../src/util/exec.js';
-import { getFreePort, waitForReady } from '../src/util/net.js';
-import { VERSION } from '../src/version.js';
-import { FIXTURE_TOOLS } from './fixture-server/tools.js';
+} from '../../src/types.js';
+import { type Exec, spawnManaged } from '../../src/util/exec.js';
+import { getFreePort, waitForReady } from '../../src/util/net.js';
+import { VERSION } from '../../src/version.js';
+import { FIXTURE_TOOLS } from '../fixture-server/tools.js';
+import {
+  CANARY,
+  canonicalEnvNames,
+  FIXTURE_SERVER,
+  INSPECTOR_PIN,
+  launchProbes,
+  NESTED_CANARY,
+  REPO_ROOT,
+  TIMEOUT_MS,
+  UNREACHABLE_URL,
+} from './harness.js';
 
-const REPO_ROOT = join(import.meta.dir, '..');
-const CLI = join(REPO_ROOT, 'src', 'cli.ts');
-const FIXTURE_SERVER = join(import.meta.dir, 'fixture-server', 'server.ts');
-/** Pinned so version resolution short-circuits instead of calling `npm view`. */
-const INSPECTOR_PIN = '2.1.0';
-const CODEX_HTTP_PIN = '0.147.0-alpha.6.5';
-const TIMEOUT_MS = 30_000;
-
-/** `repeat` is an integer: every adapter has to carry a non-string argument through unchanged. */
-const CANARY: CanarySpec = { args: { message: 'probe', repeat: 2 }, tool: 'echo_message' };
-/** The same canary as the `--canary '<tool>={json}'` flag spells it. */
-const CANARY_FLAG = `${CANARY.tool}=${JSON.stringify(CANARY.args)}`;
-/** The fixture's one tool with an `outputSchema`, on page 4 of 6 when the fixture pages one tool at a time. */
-const NESTED_CANARY: CanarySpec = { args: { config: { retries: 1 } }, tool: 'nested_config' };
+/** Under `bun test` the launcher runs from source, beside the module that resolves it. */
+const LAUNCHER = join(REPO_ROOT, 'src', 'launch-target.ts');
 const STDIO_TARGET: TargetSpec = {
   args: [FIXTURE_SERVER],
   command: process.execPath,
@@ -75,33 +68,6 @@ const RELATIVE_STDIO_TARGET: TargetSpec = {
   env: {},
   kind: 'stdio',
 };
-
-const NETWORK_LANES = process.env.CROSSCHECK_E2E_NETWORK === '1';
-const CODEX_LANE = process.env.CROSSCHECK_E2E_CODEX === '1';
-const CLAUDE_CODE_LANE = process.env.CROSSCHECK_E2E_CLAUDE_CODE === '1';
-const HAS_UV = Bun.which('uv') !== null;
-
-/** Bun's reporter prints a skip count but not the names, so each gate says why it is off. */
-if (!NETWORK_LANES) {
-  console.error('[e2e] inspector and mcpo lanes skipped — set CROSSCHECK_E2E_NETWORK=1');
-} else if (!HAS_UV) {
-  console.error('[e2e] mcpo lane skipped — uv is not on PATH');
-}
-if (!CODEX_LANE) console.error('[e2e] codex lane skipped — set CROSSCHECK_E2E_CODEX=1');
-if (!CLAUDE_CODE_LANE) {
-  console.error('[e2e] claude-code lane skipped — set CROSSCHECK_E2E_CLAUDE_CODE=1');
-}
-
-function runCli(
-  args: string[],
-  timeoutMs = 60_000,
-  env: Record<string, string> = {},
-): Promise<ExecResult> {
-  return execCapture(process.execPath, [CLI, ...args], { cwd: REPO_ROOT, env, timeoutMs });
-}
-
-/** Refuses every connection, so a run that gets past validation fails fast at ground truth. */
-const UNREACHABLE_URL = 'http://127.0.0.1:1/mcp';
 
 /** The captured shape of each fixture tool; `outputSchema` rides along only where advertised. */
 const EXPECTED_TOOLS = FIXTURE_TOOLS.map((tool) => ({
@@ -201,6 +167,68 @@ async function recordedCalls(path: string): Promise<{ cursor?: string; rpcMethod
     .map(({ cursor, rpcMethod }) => (cursor === undefined ? { rpcMethod } : { cursor, rpcMethod }));
 }
 
+/** The test process's own environment, as a client would pass all of it on. */
+function processEnv(): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(process.env).filter(
+      (entry): entry is [string, string] => entry[1] !== undefined,
+    ),
+  );
+}
+
+/**
+ * An Inspector stand-in that starts the stdio command line it is handed the way
+ * a client does: from the cwd the adapter gives it, with its own whole
+ * environment plus any `-e K=V` flags, through the SDK client. It answers
+ * `tools/list` and `tools/call` with what the server returned.
+ */
+function launchingInspectorExec(clientEnv: Record<string, string>): Exec {
+  return {
+    capture: async (_command, args, opts) => {
+      const env = { ...clientEnv };
+      let index = args.indexOf('--cli') + 1;
+      while (args[index] === '-e') {
+        const [name = '', ...value] = (args[index + 1] ?? '').split('=');
+        env[name] = value.join('=');
+        index += 2;
+      }
+      const method = args.indexOf('--method');
+      const [command = '', ...commandArgs] = args.slice(index, method);
+      const client = new Client({ name: 'inspector-stand-in', version: '0.0.0' });
+      await client.connect(
+        new StdioClientTransport({
+          args: commandArgs,
+          command,
+          ...(opts.cwd === undefined ? {} : { cwd: opts.cwd }),
+          env,
+          stderr: 'ignore',
+        }),
+      );
+      try {
+        const result =
+          args[method + 1] === 'tools/list'
+            ? await client.listTools()
+            : await client.callTool({
+                arguments: JSON.parse(args[args.indexOf('--tool-args-json') + 1] ?? '{}'),
+                name: args[args.indexOf('--tool-name') + 1] ?? '',
+              });
+        return {
+          code: 0,
+          signal: null,
+          stderr: '',
+          stdout: JSON.stringify(result),
+          timedOut: false,
+        };
+      } finally {
+        await client.close();
+      }
+    },
+    spawn: () => {
+      throw new Error('the Inspector stand-in does not spawn');
+    },
+  };
+}
+
 describe('hermetic core: stdio', () => {
   let groundTruth: GroundTruth;
 
@@ -253,6 +281,237 @@ describe('hermetic core: stdio', () => {
     );
     expect(outcome.ok).toBe(false);
     expect(outcome.detail).toContain('not_a_tool');
+  });
+});
+
+describe('hermetic core: target launch', () => {
+  test('ground truth, its canary, and a client starting the command line it was handed launch the target identically', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'crosscheck-launch-parity-'));
+    const probePath = join(dir, 'probe.jsonl');
+    const env = { CROSSCHECK_PASSED: 'from --env', MCP_FIXTURE_PROBE_PATH: probePath };
+    try {
+      const report = await runCrosscheck({
+        adapters: ['inspector'],
+        canary: CANARY,
+        // The stand-in passes its whole environment on, plus a variable only it has.
+        exec: launchingInspectorExec({ ...processEnv(), CROSSCHECK_CLIENT_ONLY: 'client' }),
+        pins: { inspector: INSPECTOR_PIN },
+        target: {
+          args: [FIXTURE_SERVER, '--flag', 'x', '-e', 'y'],
+          command: process.execPath,
+          env,
+          kind: 'stdio',
+        },
+        timeoutMs: TIMEOUT_MS,
+      });
+      expect([report.adapters[0]?.status, report.adapters[0]?.canary?.ok]).toEqual(['ok', true]);
+      expect(report.adapters[0]?.findings).toEqual([]);
+
+      // Ground truth, the ground-truth canary, the client's tools/list, and its canary.
+      const probes = await launchProbes(probePath);
+      expect(probes).toEqual(
+        Array.from({ length: 4 }, () => ({
+          argv: ['--flag', 'x', '-e', 'y'],
+          cwd: process.cwd(),
+          envNames: canonicalEnvNames(env),
+          home: process.env.HOME ?? null,
+        })),
+      );
+    } finally {
+      await rm(dir, { force: true, recursive: true });
+    }
+  });
+
+  test('hands each client a launcher command line whose spec is private to the run', async () => {
+    const secret = 'env-value-never-on-a-command-line';
+    const target: TargetSpec = {
+      args: [FIXTURE_SERVER, '--flag', 'x'],
+      command: process.execPath,
+      env: { CROSSCHECK_SECRET: secret },
+      kind: 'stdio',
+    };
+    const seen: {
+      args: string[];
+      cwd: string | undefined;
+      spec: { content: unknown; dir: string; mode: number; path: string } | null;
+    }[] = [];
+    const exec: Exec = {
+      capture: async (_command, args, opts) => {
+        const specPath = args[args.indexOf('--cli') + 3] ?? '';
+        seen.push({
+          args,
+          cwd: opts.cwd,
+          spec: specPath.endsWith('.json')
+            ? {
+                content: JSON.parse(await readFile(specPath, 'utf8')),
+                dir: dirname(specPath),
+                mode: (await stat(specPath)).mode & 0o777,
+                path: specPath,
+              }
+            : null,
+        });
+        return {
+          code: 0,
+          signal: null,
+          stderr: '',
+          stdout: JSON.stringify({ tools: FIXTURE_TOOLS }),
+          timedOut: false,
+        };
+      },
+      spawn: () => {
+        throw new Error('the launch fake does not spawn');
+      },
+    };
+    const report = await runCrosscheck({
+      adapters: ['inspector'],
+      exec,
+      pins: { inspector: INSPECTOR_PIN },
+      target,
+      timeoutMs: TIMEOUT_MS,
+    });
+    expect(report.adapters[0]?.status).toBe('ok');
+    // The report names the target as given, not the launcher that ran it.
+    expect(report.target).toEqual({ args: target.args, command: target.command, kind: 'stdio' });
+
+    expect(seen).toHaveLength(1);
+    const [call] = seen;
+    const cli = call?.args.indexOf('--cli') ?? -1;
+    const specPath = call?.spec?.path ?? 'no spec on the command line';
+    expect(call?.args.slice(cli + 1)).toEqual([
+      process.execPath,
+      LAUNCHER,
+      specPath,
+      '--method',
+      'tools/list',
+    ]);
+    expect(call?.spec).toMatchObject({
+      content: {
+        args: target.args,
+        command: target.command,
+        cwd: process.cwd(),
+        env: { ...getDefaultEnvironment(), CROSSCHECK_SECRET: secret },
+      },
+      dir: call?.cwd,
+      mode: 0o600,
+    });
+    expect(JSON.stringify(seen.map((entry) => entry.args))).not.toContain(secret);
+    // The spec and the scratch directory holding it are gone with the run.
+    await expect(stat(specPath)).rejects.toThrow('ENOENT');
+    await expect(stat(call?.cwd ?? '')).rejects.toThrow('ENOENT');
+  });
+
+  // A directory whose removal fails, as a client tree still dying in it makes it fail on Windows.
+  test.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'a scratch directory that cannot be removed still loses the launch spec, and the log names it',
+    async () => {
+      let workDir = '';
+      const exec: Exec = {
+        capture: async (_command, _args, opts) => {
+          workDir = opts.cwd ?? '';
+          await mkdir(join(workDir, 'held'));
+          await writeFile(join(workDir, 'held', 'file'), '');
+          await chmod(join(workDir, 'held'), 0o500);
+          return {
+            code: 0,
+            signal: null,
+            stderr: '',
+            stdout: JSON.stringify({ tools: FIXTURE_TOOLS }),
+            timedOut: false,
+          };
+        },
+        spawn: () => {
+          throw new Error('the cleanup fake does not spawn');
+        },
+      };
+      const lines: string[] = [];
+      try {
+        const report = await runCrosscheck({
+          adapters: ['inspector'],
+          exec,
+          log: (line) => lines.push(line),
+          pins: { inspector: INSPECTOR_PIN },
+          target: { ...STDIO_TARGET, env: { CROSSCHECK_SECRET: 'held-run' } },
+          timeoutMs: TIMEOUT_MS,
+        });
+        expect(report.adapters[0]?.status).toBe('ok');
+        await expect(stat(join(workDir, 'target-launch.json'))).rejects.toThrow('ENOENT');
+        const named = lines.filter((line) => line.includes(workDir));
+        expect(named).toHaveLength(1);
+        expect(named[0]).toStartWith(`could not remove the scratch directory ${workDir}: `);
+      } finally {
+        await chmod(join(workDir, 'held'), 0o700);
+        await rm(workDir, { force: true, recursive: true });
+      }
+    },
+  );
+
+  test('a bare relative target path runs from the caller directory', async () => {
+    const report = await runCrosscheck({
+      adapters: [],
+      canary: CANARY,
+      target: {
+        args: ['tests/fixture-server/server.ts'],
+        command: process.execPath,
+        env: {},
+        kind: 'stdio',
+      },
+      timeoutMs: TIMEOUT_MS,
+    });
+    expect([report.pass, report.groundTruth.toolCount, report.groundTruth.canary?.ok]).toEqual([
+      true,
+      6,
+      true,
+    ]);
+  });
+
+  test('a target that exits at startup reports what it wrote to stderr', async () => {
+    const fatal = 'fatal: FOO_API_KEY is not set; refusing to start';
+    const target = stdioFixture({ MCP_FIXTURE_FATAL: fatal });
+    await expect(captureGroundTruth(target, TIMEOUT_MS)).rejects.toThrow(fatal);
+    expect((await runGroundTruthCanary(target, CANARY, TIMEOUT_MS)).detail).toContain(fatal);
+    const run = runCrosscheck({ adapters: [], target, timeoutMs: TIMEOUT_MS });
+    await expect(run).rejects.toThrow(fatal);
+    await expect(run).rejects.not.toBeInstanceOf(CrosscheckUsageError);
+  });
+
+  test('a target that floods stderr past the pipe buffer keeps serving, and a failure carries only the tail', async () => {
+    // Far past every buffer between the server's blocking write and the drain.
+    const flood = String(4 * 1024 * 1024);
+    const served = await captureGroundTruth(
+      stdioFixture({ MCP_FIXTURE_STDERR_BYTES: flood }),
+      TIMEOUT_MS,
+    );
+    expect(served.tools).toEqual(EXPECTED_TOOLS);
+
+    const fatal = 'error: the configuration file is unreadable';
+    const failure = await captureGroundTruth(
+      stdioFixture({ MCP_FIXTURE_FATAL: fatal, MCP_FIXTURE_STDERR_BYTES: flood }),
+      TIMEOUT_MS,
+    ).then(
+      () => null,
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toContain(fatal);
+    expect((failure as Error).message.length).toBeLessThan(1_000);
+  });
+
+  test('a request a live target fails carries none of its stderr', async () => {
+    const outcome = await runGroundTruthCanary(
+      stdioFixture({ MCP_FIXTURE_INVALID_OUTPUT: 'mismatch', MCP_FIXTURE_STDERR_BYTES: '64' }),
+      NESTED_CANARY,
+      TIMEOUT_MS,
+    );
+    expect(outcome.ok).toBe(false);
+    expect(outcome.detail).toContain("Structured content does not match the tool's output schema");
+    expect(outcome.detail).not.toContain('x'.repeat(32));
+  });
+
+  test('a target command that cannot start fails ground truth with the spawn error', async () => {
+    const missing = join(tmpdir(), 'crosscheck-no-such-command');
+    await expect(
+      captureGroundTruth({ args: [], command: missing, env: {}, kind: 'stdio' }, TIMEOUT_MS),
+    ).rejects.toThrow('ENOENT');
   });
 });
 
@@ -468,6 +727,55 @@ describe('hermetic core: protected streamable-http', () => {
       ).rejects.not.toThrow(secret);
     } finally {
       proc.kill();
+    }
+  });
+
+  /**
+   * Header values a failing canary's text echoes: one straddling the 400-character
+   * excerpt cut, one holding a tab and repeated spaces that the excerpt collapses.
+   */
+  const ECHOED_HEADER_VALUES = [
+    {
+      text: (value: string) => `${'x'.repeat(390)} ${value} tail`,
+      value: 'zq7-straddle-9f8e7d6c5b4a',
+    },
+    {
+      text: (value: string) => `error: upstream rejected Authorization ${value}`,
+      value: 'Bearer\tzq7  tabbed',
+    },
+  ];
+
+  /** Neither the value, a prefix of it, nor its whitespace-collapsed form survived. */
+  function expectRedacted(text: string | null | undefined, value: string): void {
+    expect(text).toMatch(/\[REDACTE/);
+    expect(text).not.toContain(value.slice(0, 5));
+    expect(text).not.toContain(value.replace(/\s+/g, ' '));
+  }
+
+  test('a canary failure is redacted before it is excerpted', async () => {
+    for (const { text, value } of ECHOED_HEADER_VALUES) {
+      const { stop, target } = await startHttpFixture({ MCP_FIXTURE_CALL_ERROR: text(value) });
+      try {
+        const protectedTarget = { ...target, headers: { 'X-Token': value } };
+        const outcome = await runGroundTruthCanary(protectedTarget, CANARY, TIMEOUT_MS);
+        expect(outcome.ok).toBe(false);
+        expectRedacted(outcome.detail, value);
+
+        const error = await runCrosscheck({
+          adapters: [],
+          canary: CANARY,
+          target: protectedTarget,
+          timeoutMs: TIMEOUT_MS,
+        }).then(
+          () => null,
+          (reason: unknown) => reason,
+        );
+        expect(error).toBeInstanceOf(CrosscheckUsageError);
+        expect((error as Error).message).toContain('before any adapter ran');
+        expectRedacted((error as Error).message, value);
+      } finally {
+        stop();
+      }
     }
   });
 });
@@ -866,6 +1174,19 @@ describe('hermetic core: orchestration', () => {
     }
   });
 
+  test('rejects a blank, whitespace-only, or non-string pin before ground truth, naming the adapter', async () => {
+    // codex is not selected: a pin is checked whether or not its adapter runs.
+    const pinSets = [{ inspector: '' }, { inspector: '   ' }, { inspector: '\t' }, { codex: '' }];
+    for (const pins of [...pinSets, { mcpo: 20 as unknown as string }]) {
+      const { error, logs } = await rejectionOf({ adapters: ['inspector'], pins });
+      expect(error).toBeInstanceOf(CrosscheckUsageError);
+      expect(String(error)).toContain(
+        `pin for adapter "${Object.keys(pins)[0]}" must be a non-blank version string`,
+      );
+      expect(logs).toEqual([]);
+    }
+  });
+
   test('rejects an unparseable or non-HTTP target URL before ground truth', async () => {
     for (const url of ['notaurl', '/mcp', 'ftp://127.0.0.1:1/mcp', 'file:///tmp/mcp']) {
       const { error, logs } = await rejectionOf({ target: { kind: 'http', url } });
@@ -941,7 +1262,7 @@ describe('hermetic core: orchestration', () => {
     }
   });
 
-  test('canonicalizes a relative programmatic target and persists ground truth', async () => {
+  test('runs a relative programmatic target as given and persists ground truth', async () => {
     const artifactsDir = await mkdtemp(join(tmpdir(), 'crosscheck-e2e-'));
     try {
       const report = await runCrosscheck({
@@ -961,7 +1282,7 @@ describe('hermetic core: orchestration', () => {
       expect(report.groundTruth.findings).toEqual([]);
       expect(report.groundTruth.depthLimitedPaths).toEqual([]);
       expect(report.target).toEqual({
-        args: [FIXTURE_SERVER],
+        args: ['./tests/fixture-server/server.ts'],
         command: process.execPath,
         kind: 'stdio',
       });
@@ -1351,618 +1672,4 @@ describe('hermetic core: orchestration', () => {
       await rm(dir, { force: true, recursive: true });
     }
   });
-});
-
-describe('CLI process lane', () => {
-  test('--help exits 0 and prints the usage block', async () => {
-    const result = await runCli(['--help']);
-    expect(result.code).toBe(0);
-    expect(result.stdout).toContain('mcp-crosscheck [flags]');
-    expect(result.stdout).toContain('claude-code');
-  });
-
-  test('--help names every artifact file and marks --env stdio only', async () => {
-    const { stdout } = await runCli(['--help']);
-    for (const file of [
-      'report.json',
-      'ground-truth.json',
-      'mcpo.openapi.json',
-      'codex.request.json',
-      'claude-code.request.json',
-    ]) {
-      expect(stdout).toContain(file);
-    }
-    expect(stdout).toMatch(/--env <K=V>.*stdio only/);
-  });
-
-  test('--help and --version print text even with --json: they are not runs', async () => {
-    const help = await runCli(['--json', '--help']);
-    expect(help.code).toBe(0);
-    expect(help.stdout).toContain('mcp-crosscheck [flags]');
-    const version = await runCli(['--json', '--version']);
-    expect(version.stdout.trim()).toBe(VERSION);
-  });
-
-  test('--version prints the package version', async () => {
-    const result = await runCli(['--version']);
-    expect(result.code).toBe(0);
-    expect(result.stdout.trim()).toBe(VERSION);
-  });
-
-  const STDIO = ['--', 'node', 'server.js'];
-  const UNKNOWN_ADAPTER = (name: string) =>
-    `unknown adapter "${name}" — known adapters: inspector, mcpo, codex, claude-code`;
-  const TIMEOUT_USAGE = (raw: string) =>
-    `--timeout must be a number of seconds from 0.001 to 2147483.647 (about 24.8 days), got: ${raw}`;
-  const URL_USAGE = 'target URL must be an http: or https: URL, got: ';
-  const USAGE_ERRORS: { args: string[]; message?: string; name: string }[] = [
-    { args: [], name: 'no target at all' },
-    { args: ['--adapters', 'nope', ...STDIO], name: 'an unknown adapter name' },
-    ...['toString', 'constructor', '__proto__'].map((name) => ({
-      args: ['--adapters', name, ...STDIO],
-      message: UNKNOWN_ADAPTER(name),
-      name: `the inherited adapter name ${name}`,
-    })),
-    ...['constructor', '__proto__'].map((name) => ({
-      args: ['--pin', `${name}=1`, ...STDIO],
-      message: `--pin names unknown adapter "${name}"`,
-      name: `a --pin naming the inherited key ${name}`,
-    })),
-    {
-      args: ['--adapters', 'inspector,inspector', ...STDIO],
-      message: 'adapter "inspector" is selected more than once',
-      name: 'a repeated adapter name',
-    },
-    { args: ['--canary', 'malformed', ...STDIO], name: 'a canary without `=`' },
-    {
-      args: ['--canary', 'echo_message=[1,2]', ...STDIO],
-      name: 'canary args that are not a JSON object',
-    },
-    {
-      args: ['--http', UNREACHABLE_URL, ...STDIO],
-      name: '--http alongside a stdio command',
-    },
-    {
-      args: ['--http', UNREACHABLE_URL, '--env', 'FOO=bar'],
-      message: '--env is supported only with a stdio target',
-      name: '--env with an HTTP target',
-    },
-    {
-      args: ['--http', 'notaurl'],
-      message: `${URL_USAGE}notaurl`,
-      name: 'an unparseable --http URL',
-    },
-    {
-      args: ['--http', 'ftp://127.0.0.1:1/mcp'],
-      message: `${URL_USAGE}ftp://127.0.0.1:1/mcp`,
-      name: 'a non-HTTP --http URL',
-    },
-    {
-      args: ['--adpaters', 'inspector', ...STDIO],
-      message: "Unknown option '--adpaters'",
-      name: 'an unknown flag',
-    },
-    { args: ['--timeout'], message: 'argument missing', name: 'a flag missing its value' },
-    {
-      args: ['--update-baseline=yes', ...STDIO],
-      message: "Option '--update-baseline' does not take an argument",
-      name: 'a value on a boolean flag',
-    },
-    { args: ['--timeout', '0', ...STDIO], name: 'a non-positive --timeout' },
-    {
-      args: ['--timeout', 'soon', ...STDIO],
-      message: TIMEOUT_USAGE('soon'),
-      name: 'a non-numeric --timeout',
-    },
-    {
-      args: ['--timeout', '3000000', ...STDIO],
-      message: TIMEOUT_USAGE('3000000'),
-      name: 'a --timeout past the timer range',
-    },
-    {
-      args: ['--timeout', '0.0001', ...STDIO],
-      message: TIMEOUT_USAGE('0.0001'),
-      name: 'a --timeout below one millisecond',
-    },
-  ];
-
-  for (const scenario of USAGE_ERRORS) {
-    test(`exits 2 on ${scenario.name}`, async () => {
-      const result = await runCli(scenario.args);
-      expect(result.code).toBe(2);
-      expect(result.stderr).toContain('mcp-crosscheck:');
-      if (scenario.message !== undefined) expect(result.stderr).toContain(scenario.message);
-      expect(result.stderr).not.toContain('capturing ground truth');
-      expect(result.stdout).toBe('');
-    });
-  }
-
-  test('--adapters and --pin with valid names pass validation and reach ground truth', async () => {
-    const result = await runCli([
-      '--adapters',
-      'mcpo,inspector',
-      '--pin',
-      'mcpo=0.0.20',
-      '--timeout',
-      '2147483.647',
-      '--http',
-      UNREACHABLE_URL,
-    ]);
-    expect(result.code).toBe(1);
-    expect(result.stderr).toContain('capturing ground truth');
-  });
-
-  test('--env still reaches a stdio server', async () => {
-    // Switching the fixture to HTTP through --env leaves the stdio client unanswered.
-    const port = await getFreePort();
-    const result = await runCli([
-      '--env',
-      'MCP_TRANSPORT_TYPE=http',
-      '--env',
-      `MCP_HTTP_PORT=${port}`,
-      '--timeout',
-      '2',
-      '--adapters',
-      'claude-code',
-      '--',
-      process.execPath,
-      FIXTURE_SERVER,
-    ]);
-    expect(result.code).toBe(1);
-    expect(result.stderr).toContain('ground-truth client timed out after 2000ms');
-  }, 30_000);
-
-  describe('--json', () => {
-    function errorDocument(stdout: string): ErrorReport {
-      return JSON.parse(stdout) as ErrorReport;
-    }
-
-    test('a usage error prints one usage error document and exits 2', async () => {
-      const result = await runCli(['--json', '--adapters', 'bogus', ...STDIO]);
-      expect(result.code).toBe(2);
-      expect(errorDocument(result.stdout)).toEqual({
-        error: { kind: 'usage', message: UNKNOWN_ADAPTER('bogus') },
-        reportVersion: 1,
-      });
-      expect(result.stderr).toContain(`mcp-crosscheck: ${UNKNOWN_ADAPTER('bogus')}`);
-    });
-
-    test('a flag-parse error still answers in JSON when --json was given', async () => {
-      for (const args of [
-        ['--json', '--adpaters', 'inspector', ...STDIO],
-        ['--adapters', 'inspector', '--json', '--timeout'],
-        ['--json=yes', ...STDIO],
-        // A string flag missing its value right before --json.
-        ['--timeout', '--json', ...STDIO],
-        ['--baseline', '--json', ...STDIO],
-      ]) {
-        const result = await runCli(args);
-        expect(result.code).toBe(2);
-        const document = errorDocument(result.stdout);
-        expect(document.reportVersion).toBe(1);
-        expect(document.error.kind).toBe('usage');
-      }
-    });
-
-    test('--json after the `--` terminator belongs to the server, not crosscheck', async () => {
-      const result = await runCli(['--adapters', 'bogus', ...STDIO, '--json']);
-      expect(result.code).toBe(2);
-      expect(result.stdout).toBe('');
-    });
-
-    test('a ground-truth failure prints a runtime error document without header values', async () => {
-      const port = await getFreePort();
-      const secret = 'json-error-secret';
-      const proc = spawnManaged(process.execPath, [FIXTURE_SERVER], {
-        env: {
-          MCP_HTTP_PORT: String(port),
-          MCP_REJECT_HEADER: '1',
-          MCP_REQUIRED_HEADER_NAME: 'X-Fixture-Auth',
-          MCP_REQUIRED_HEADER_VALUE: secret,
-          MCP_TRANSPORT_TYPE: 'http',
-        },
-      });
-      try {
-        const failure = await waitForReady({
-          failFast: () =>
-            proc.hasExited() ? `fixture server exited — ${proc.stderrTail()}` : null,
-          intervalMs: 50,
-          probe: () => Promise.resolve(proc.stderrTail().includes('streamable-http on')),
-          timeoutMs: TIMEOUT_MS,
-        });
-        if (failure !== null) throw new Error(failure);
-        const result = await runCli([
-          '--json',
-          '--adapters',
-          'inspector',
-          '--header',
-          `X-Fixture-Auth: ${secret}`,
-          '--http',
-          `http://127.0.0.1:${port}/mcp`,
-        ]);
-        expect(result.code).toBe(1);
-        const document = errorDocument(result.stdout);
-        expect(document.reportVersion).toBe(1);
-        expect(document.error.kind).toBe('runtime');
-        expect(document.error.message).toContain('[REDACTED]');
-        expect(result.stdout).not.toContain(secret);
-        expect(result.stderr).not.toContain(secret);
-      } finally {
-        proc.kill();
-      }
-    }, 30_000);
-
-    test('a report run prints exactly one versioned report document', async () => {
-      // An empty PATH makes the installed-client lookup fail without launching anything.
-      const emptyPath = await mkdtemp(join(tmpdir(), 'crosscheck-empty-path-'));
-      try {
-        const result = await runCli(
-          ['--json', '--adapters', 'claude-code', '--', process.execPath, FIXTURE_SERVER],
-          60_000,
-          { PATH: emptyPath },
-        );
-        expect(result.code).toBe(1);
-        const report = JSON.parse(result.stdout) as RunReport;
-        expect(report.reportVersion).toBe(1);
-        expect(report.adapters.map((adapter) => adapter.status)).toEqual(['adapter-broken']);
-      } finally {
-        await rm(emptyPath, { force: true, recursive: true });
-      }
-    }, 30_000);
-
-    test('without --json a failing run leaves stdout empty', async () => {
-      const result = await runCli(['--adapters', 'inspector', '--http', UNREACHABLE_URL]);
-      expect(result.code).toBe(1);
-      expect(result.stdout).toBe('');
-    });
-  });
-
-  test('removes the scratch directory when the artifacts directory cannot be created', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'crosscheck-scratch-cleanup-'));
-    const scratchRoot = join(dir, 'tmp');
-    const blocker = join(dir, 'blocker');
-    try {
-      await mkdir(scratchRoot);
-      await writeFile(blocker, 'a file where the artifacts parent should be');
-      const result = await runCli(
-        ['--adapters', 'inspector', '--artifacts', join(blocker, 'artifacts'), ...STDIO],
-        60_000,
-        { TEMP: scratchRoot, TMP: scratchRoot, TMPDIR: scratchRoot },
-      );
-      expect(result.code).toBe(1);
-      expect(result.stderr).not.toContain('capturing ground truth');
-      const leftovers = (await readdir(scratchRoot)).filter((name) =>
-        name.startsWith('mcp-crosscheck-'),
-      );
-      expect(leftovers).toEqual([]);
-    } finally {
-      await rm(dir, { force: true, recursive: true });
-    }
-  });
-
-  test('exits 2 when the canary names a tool the server never advertised', async () => {
-    const result = await runCli(['--canary', 'nope={}', '--', process.execPath, FIXTURE_SERVER]);
-    expect(result.code).toBe(2);
-    expect(result.stderr).toContain('not advertised by the server');
-  });
-
-  test('exits 2 when the canary result violates its output schema, before any adapter runs', async () => {
-    // An empty PATH would make the installed-client lookup fail, had the adapter been reached.
-    const emptyPath = await mkdtemp(join(tmpdir(), 'crosscheck-empty-path-'));
-    try {
-      const result = await runCli(
-        [
-          '--adapters',
-          'claude-code',
-          '--canary',
-          `${NESTED_CANARY.tool}=${JSON.stringify(NESTED_CANARY.args)}`,
-          '--env',
-          'MCP_FIXTURE_INVALID_OUTPUT=mismatch',
-          '--',
-          process.execPath,
-          FIXTURE_SERVER,
-        ],
-        60_000,
-        { PATH: emptyPath },
-      );
-      expect(result.code).toBe(2);
-      expect(result.stderr).toContain("Structured content does not match the tool's output schema");
-      expect(result.stderr).not.toContain('running adapter');
-    } finally {
-      await rm(emptyPath, { force: true, recursive: true });
-    }
-  }, 30_000);
-
-  test('exits 2 when claude-code is selected for an HTTP target', async () => {
-    const result = await runCli(['--adapters', 'claude-code', '--http', 'http://127.0.0.1:1/mcp']);
-    expect(result.code).toBe(2);
-    expect(result.stderr).toContain('claude-code adapter supports stdio targets only');
-  });
-
-  test('validates repeatable HTTP headers without echoing supplied values', async () => {
-    const secret = 'must-not-appear';
-    const scenarios = [
-      ['--header', `Bad Name: ${secret}`],
-      ['--header', `X-Test: ${secret}`, '--header', 'x-test: duplicate'],
-      ['--header', `NoColon${secret}`],
-      ['--header', `: ${secret}`],
-      ['--header', 'X-Empty:   '],
-    ];
-    for (const flags of scenarios) {
-      const result = await runCli([...flags, '--http', 'http://127.0.0.1:1/mcp']);
-      expect(result.code).toBe(2);
-      expect(result.stderr).toContain('--header');
-      expect(result.stderr).not.toContain(secret);
-    }
-    const stdio = await runCli([
-      '--header',
-      `Authorization: Bearer ${secret}`,
-      '--',
-      process.execPath,
-      FIXTURE_SERVER,
-    ]);
-    expect(stdio.code).toBe(2);
-    expect(stdio.stderr).not.toContain(secret);
-  });
-
-  test('validates coupled baseline flags before running the target', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'crosscheck-baseline-cli-'));
-    const missing = join(dir, 'missing.json');
-    try {
-      const readOnly = await runCli([
-        '--baseline',
-        missing,
-        '--',
-        process.execPath,
-        FIXTURE_SERVER,
-      ]);
-      // Whole-result matches: a failure prints signal, spawnErrorCode, and stderr, not just the code.
-      expect(readOnly).toMatchObject({ code: 2 });
-      const uncoupled = await runCli(['--update-baseline', '--', process.execPath, FIXTURE_SERVER]);
-      expect(uncoupled).toMatchObject({ code: 2 });
-    } finally {
-      await rm(dir, { force: true, recursive: true });
-    }
-  });
-
-  test('rejects a normalized baseline path that aliases a generated report artifact', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'crosscheck-baseline-alias-'));
-    try {
-      const result = await runCli([
-        '--adapters',
-        'claude-code',
-        '--artifacts',
-        dir,
-        '--baseline',
-        join(dir, 'nested', '..', 'report.json'),
-        '--update-baseline',
-        '--http',
-        'http://127.0.0.1:1/mcp',
-      ]);
-      expect(result.code).toBe(2);
-      expect(result.stderr).toContain('baseline');
-      expect(result.stderr).toContain('report.json');
-      expect(result.stderr).toContain('artifact');
-      expect(result.stderr).not.toContain('supports stdio targets only');
-    } finally {
-      await rm(dir, { force: true, recursive: true });
-    }
-  });
-});
-
-describe.skipIf(!NETWORK_LANES)('inspector lane', () => {
-  test('resolves the relative fixture target before the neutral-cwd adapter run', async () => {
-    const result = await runCli(
-      [
-        '--adapters',
-        'inspector',
-        '--pin',
-        `inspector=${INSPECTOR_PIN}`,
-        '--canary',
-        CANARY_FLAG,
-        '--json',
-        '--',
-        process.execPath,
-        './tests/fixture-server/server.ts',
-      ],
-      300_000,
-    );
-    expect(result.code).toBe(0);
-    const report = JSON.parse(result.stdout) as RunReport;
-    expect(report.reportVersion).toBe(1);
-    expect(report.pass).toBe(true);
-    expect(report.target).toEqual({
-      args: [FIXTURE_SERVER],
-      command: process.execPath,
-      kind: 'stdio',
-    });
-    const [inspector] = report.adapters;
-    expect(inspector?.adapter).toBe('inspector');
-    expect(inspector?.status).toBe('ok');
-    expect(inspector?.resolvedVersion).toBe(INSPECTOR_PIN);
-    expect(inspector?.toolCount).toBe(6);
-    expect(inspector?.canary?.ok).toBe(true);
-    expect(inspector?.findings).toEqual([]);
-  }, 360_000);
-
-  /**
-   * The encoding claim, measured against the client itself: the fixture echoes
-   * back the arguments it received, so a deep equality against what went in
-   * proves each shape survived. `--tool-arg key=value` would coerce the string
-   * `"123"` to a number and reject the empty one before the call went out.
-   */
-  test('--tool-args-json delivers every argument shape verbatim', async () => {
-    const args = {
-      blank: '',
-      count: 3,
-      equals: 'left=right',
-      flag: true,
-      message: '123',
-      nested: { depth: { value: 1 } },
-    };
-    const result = await execCapture(
-      'npx',
-      [
-        '-y',
-        `@modelcontextprotocol/inspector@${INSPECTOR_PIN}`,
-        '--cli',
-        process.execPath,
-        FIXTURE_SERVER,
-        '--method',
-        'tools/call',
-        '--tool-name',
-        'echo_message',
-        '--tool-args-json',
-        JSON.stringify(args),
-      ],
-      // A neutral cwd, the same reason the adapter runs package runners from one.
-      { cwd: tmpdir(), timeoutMs: 300_000 },
-    );
-    expect(result.code).toBe(0);
-    const body = result.stdout.trim();
-    const call = JSON.parse(body.slice(body.indexOf('{'), body.lastIndexOf('}') + 1)) as {
-      content: { text: string }[];
-    };
-    expect(JSON.parse(call.content[0]?.text ?? '{}')).toEqual(args);
-  }, 360_000);
-});
-
-describe.skipIf(!NETWORK_LANES || !HAS_UV)('mcpo lane', () => {
-  /**
-   * The verdict belongs to the converter, not the harness: mcpo drops type
-   * information the fixture deliberately carries, so this asserts the
-   * classification and the rendered surface rather than a pass.
-   */
-  test('renders the fixture through the OpenAPI proxy, or classifies a broken upstream', async () => {
-    const result = await runCli(
-      [
-        '--adapters',
-        'mcpo',
-        // mcpo leaves its `mcp` dependency unbounded; the constraint is the
-        // documented escape hatch for a resolve that would otherwise import-fail.
-        '--mcpo-with',
-        'mcp<2',
-        '--canary',
-        CANARY_FLAG,
-        '--json',
-        '--',
-        process.execPath,
-        FIXTURE_SERVER,
-      ],
-      300_000,
-    );
-    const report = JSON.parse(result.stdout) as RunReport;
-    const [mcpo] = report.adapters;
-    expect(mcpo?.adapter).toBe('mcpo');
-    expect(mcpo?.resolvedVersion).not.toBeNull();
-    if (mcpo?.status === 'adapter-broken') {
-      expect(mcpo.findings.map((finding) => finding.rule)).toEqual(['adapter-broken']);
-      return;
-    }
-    expect(mcpo?.status).toBe('ok');
-    expect(mcpo?.toolCount).toBe(6);
-    expect(mcpo?.canary?.ok).toBe(true);
-  }, 360_000);
-});
-
-describe.skipIf(!CODEX_LANE)('codex lane', () => {
-  test('captures the converted tool surface through the provider intercept', async () => {
-    const result = await runCli(
-      ['--adapters', 'codex', '--json', '--', process.execPath, FIXTURE_SERVER],
-      540_000,
-    );
-    const report = JSON.parse(result.stdout) as RunReport;
-    const [codex] = report.adapters;
-    expect(codex?.adapter).toBe('codex');
-    expect(codex?.status).toBe('ok');
-    expect(codex?.toolCount).toBe(6);
-    expect(codex?.canary).toEqual({
-      attempted: false,
-      detail: 'codex adapter is capture-only',
-      ok: null,
-    });
-  }, 600_000);
-
-  test('captures a protected streamable-http target with environment-backed headers', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'crosscheck-codex-http-'));
-    const recordPath = join(dir, 'requests.jsonl');
-    const port = await getFreePort();
-    const secret = 'codex-http-dummy';
-    const proc = spawnManaged(process.execPath, [FIXTURE_SERVER], {
-      env: {
-        MCP_HTTP_PORT: String(port),
-        MCP_HTTP_RECORD_PATH: recordPath,
-        MCP_REQUIRED_HEADER_NAME: 'X-Fixture-Auth',
-        MCP_REQUIRED_HEADER_VALUE: secret,
-        MCP_TRANSPORT_TYPE: 'http',
-      },
-    });
-    try {
-      const failure = await waitForReady({
-        failFast: () => (proc.hasExited() ? `fixture server exited — ${proc.stderrTail()}` : null),
-        intervalMs: 50,
-        probe: () => Promise.resolve(proc.stderrTail().includes('streamable-http on')),
-        timeoutMs: TIMEOUT_MS,
-      });
-      if (failure !== null) throw new Error(failure);
-      const result = await runCli(
-        [
-          '--adapters',
-          'codex',
-          '--pin',
-          `codex=${CODEX_HTTP_PIN}`,
-          '--header',
-          `X-Fixture-Auth: ${secret}`,
-          '--artifacts',
-          dir,
-          '--json',
-          '--http',
-          `http://127.0.0.1:${port}/mcp`,
-        ],
-        540_000,
-      );
-      expect(result.code).toBe(0);
-      const report = JSON.parse(result.stdout) as RunReport;
-      const [codex] = report.adapters;
-      expect(codex?.resolvedVersion).toBe(CODEX_HTTP_PIN);
-      expect(codex?.status).toBe('ok');
-      expect(codex?.toolCount).toBe(6);
-      expect(codex?.findings).toHaveLength(6);
-      expect(codex?.findings.every((finding) => finding.rule === 'constraint-dropped')).toBe(true);
-      expect(result.stdout).not.toContain(secret);
-      expect(await readFile(join(dir, 'report.json'), 'utf8')).not.toContain(secret);
-      expect(await readFile(join(dir, 'codex.request.json'), 'utf8')).not.toContain(secret);
-    } finally {
-      proc.kill();
-      await rm(dir, { force: true, recursive: true });
-    }
-  }, 600_000);
-});
-
-describe.skipIf(!CLAUDE_CODE_LANE)('claude-code lane', () => {
-  test('captures the converted tool surface through the isolated base-URL intercept', async () => {
-    // Claude Code updates itself, so the lane exercises whichever release is installed.
-    const installed = Bun.spawnSync(['claude', '--version']).stdout.toString().split(' ')[0];
-    const result = await runCli(
-      ['--adapters', 'claude-code', '--json', '--', process.execPath, FIXTURE_SERVER],
-      540_000,
-    );
-    const report = JSON.parse(result.stdout) as RunReport;
-    const [claudeCode] = report.adapters;
-    expect(claudeCode?.adapter).toBe('claude-code');
-    expect(claudeCode?.resolvedVersion).toBe(installed);
-    expect(claudeCode?.status).toBe('ok');
-    expect(claudeCode?.toolCount).toBe(6);
-    expect(claudeCode?.canary).toEqual({
-      attempted: false,
-      detail: 'claude-code adapter is capture-only',
-      ok: null,
-    });
-    expect(claudeCode?.findings.map((finding) => [finding.rule, finding.path])).toEqual([
-      ['description-altered', 'union_modes'],
-      ['anyof-ignored', 'union_modes'],
-      ['description-altered', 'branch_only_fields'],
-      ['anyof-ignored', 'branch_only_fields'],
-    ]);
-  }, 600_000);
 });
