@@ -2,6 +2,24 @@
 
 All notable changes to mcp-crosscheck are documented here.
 
+## 0.3.0 — 2026-11-15
+
+Launcher parity, capture and rename rules.
+
+- Breaking for library consumers: `AdapterContext.target` is now `AdapterTarget`, whose stdio member carries only `command` and `args`, since the environment and working directory live in the launcher's spec; `AdapterRunResult.status` gains `capture-failure`; `RuleId` and `FindingEvidence` gain `capture-failure` and `tool-renamed`. `AdapterRunResult` gains an optional `emptyCapture`, `Adapter` an optional `toolRenames`, and `compareSurface` and `buildFindings` an optional `renames` argument. `RuntimeRuleId`, `AdapterTarget`, `ToolRename`, `ToolRenameMap`, `ToolRenameChange`, `claudeCodeToolRenames`, `codexToolRenames`, and `pairEmptyCapture` are new exports.
+- A stdio target starts the same way under ground truth and every client: each client runs it through a launcher with the command and arguments as given, the SDK's default environment plus `--env` and nothing else from your shell, and the working directory crosscheck runs from. The launch spec sits in a file only the current user can read, inside the run's scratch directory, so `--env` values and arguments no longer pass through Inspector's `-e` flags, Codex's TOML keys, or mcpo's own environment. (#44, #53, #38)
+- Ground truth reads a stdio target's stderr for the whole session, and a session that fails after the target exited reports the end of what the target wrote there.
+- New `capture-failure` rule (fail): the client finished, but crosscheck could not read what it captured: exit-0 output that did not parse, output cut at the capture limit, an `openapi.json` that is not an OpenAPI document, or an MCP tool entry in a Codex or Claude Code request that could not be read. These were reported as `handshake-failure`. Like `adapter-broken`, it is never baselined, and a run that reports one leaves its baseline file unchanged. `ExecResult` gains `stdoutTruncated`. (#37)
+- New `tool-renamed` rule (info): a tool the client renders under another name, with `change: sanitized` or `hashed`. Codex's rename is ported from its source (characters outside `[A-Za-z0-9_]` become `_`; names that collide or exceed 128 bytes beside `mcp__target` take a SHA-1 suffix), and Claude Code's likewise (characters outside `[a-zA-Z0-9_-]` become `_`). The tool is compared under its advertised name, with every finding at its ground-truth path, instead of being reported as `tool-missing`. A name Claude Code never sends, because its prefixed form passes 128 characters or an earlier tool renders the same, is `tool-missing` with the reason in its detail. (#41)
+- Codex and Claude Code runs against a server that advertises no tools end in a clean empty surface; a capture with no MCP tools is a `handshake-failure` only when ground truth lists a tool the client would send. (#49)
+- An unpinned adapter spawns exactly the release it reports: Inspector as `@modelcontextprotocol/inspector@<version>` and mcpo as `mcpo@<version>`, from the registry's latest, and Codex from a `--version` prime that installs the release into your npm cache, which the launch reads through `npm_config_cache`. A failed lookup spawns `@latest` and reports no version. (#36, #50)
+- mcpo runs with `mcp<2` and `fastapi<0.145` by default, since unpinned mcpo 0.0.20 fails to import against Python `mcp` 2.x and FastAPI 0.145. A `--mcpo-with` entry naming either package replaces that default; any other entry is added alongside. The first `openapi.json` response is the capture, and a non-2xx answer is a `handshake-failure`. (#55)
+- A client that cannot start reports why: a missing `npx` or `uvx` is `adapter-broken` naming what provides it, other spawn refusals such as `E2BIG` carry their error text, and a spawn that throws no longer aborts the run. `ExecResult` and `ManagedProcess.exited` report `spawnErrorCode` for both. (#69)
+- Canary, status, and adapter-failure details are redacted whole before they are excerpted, so a header value is no longer cut where redaction cannot match it. (#71)
+- A blank `pins` value is a usage error from `runCrosscheck`, and `--pin` naming the same adapter twice is a usage error from the CLI. (#64)
+- The scratch directory is removed with retries, launch spec first, and a directory that cannot be removed is named in the log. `devcheck` fails when `dist/launch-target.js` was not built.
+- Dependencies: `@modelcontextprotocol/sdk` ^1.30.1 → ^1.32.2, `zod` ^4.6.5 → ^4.6.7, `@biomejs/biome` 2.5.14 → 2.6.7, `@types/bun` ^1.4.2 → ^1.4.4, `@types/node` 26.6.2 → 26.6.6, `packageManager` bun@1.4.2 → bun@1.4.4; new `cross-spawn` ^7.0.6 and `@types/cross-spawn` ^6.0.6 for the launcher.
+
 ## 0.2.0 — 2026-09-26
 
 Engine fidelity and a versioned report contract.
